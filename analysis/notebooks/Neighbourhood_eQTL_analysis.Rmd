@@ -1,0 +1,1083 @@
+---
+title: "Randolph neighbourhood-level eQTL testing"
+output: html_notebook
+---
+
+I've run the DA-GWAS over the mock-infected PBMCs from Randolph _et al._ using the Milo2.0, and found a general lack of overlap with cluster-level eQTLs or colocalisation 
+with the eQTL catalogue. Here I will select genes proximal to each csQTL and perform neighbourhood resolution eQTL testing on the expressed proximal genes in each using 
+`MatrixEQTL`. These are then used as input to perform colocalisation analysis between neighbourhood resolution eQTLs and csQTLs.
+
+```{r}
+suppressMessages({
+library(SingleCellExperiment)
+library(miloR)
+library(Matrix)
+library(MatrixGenerics)
+library(ggplot2)
+library(ggsci)
+library(ggrepel)
+library(ggrastr)
+library(cowplot)
+library(scales)
+library(scattermore)
+library(BiocParallel)
+library(MatrixEQTL)
+library(biomaRt)
+library(stringr)
+library(dplyr)
+library(coloc)
+library(VennDiagram)
+library(grDevices)
+library(scico)
+library(viridis)
+library(ggtext)
+library(glue)
+library(readr)
+library(colorspace)
+})
+```
+
+# Read in Milo object
+
+```{r}
+rand.ni.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_Milo.RDS")
+rand.ni.meta <- as.data.frame(colData(rand.ni.milo))
+rand.ni.meta$CellID <- colnames(rand.ni.milo)
+rand.ni.fr <- as.data.frame(reducedDim(rand.ni.milo, "UMAP"))
+rand.ni.fr$CellID <- colnames(rand.ni.milo)
+
+rand.ni.meta <- merge(rand.ni.meta, rand.ni.fr, by="CellID")
+```
+
+```{r}
+# use this for annotating the csQTL results
+glmm.da.res <- read.table("~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+                      sep="\t", header=TRUE, stringsAsFactors = FALSE)
+```
+
+# Extract lead SNPs
+
+```{r}
+# gwas results files - do these only contain the nhoods for which the SNP is DA?
+gwas.dir <- "~/Dropbox/GLMM/locus.dir/"
+gwas.files <- list.files(gwas.dir, pattern="\\.gz$", full.names=TRUE, recursive=TRUE, include.dirs=TRUE)
+gwas.list <- list()
+for(x in seq_along(gwas.files)){
+  x.file <- gwas.files[x]
+  x.lead <- gsub(x.file, pattern="([[:ascii:]]*)/(chr[0-9]+)/([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)(_locus\\.tsv\\.gz)", 
+                 replacement="\\3_\\4_\\5_\\6", perl=TRUE)
+  x.chr <- gsub(x.lead, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1")
+  x.bp <- as.numeric(gsub(x.lead, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+  
+  # tabix this for speed
+  x.tab.query <- paste0("tabix ", x.file, " ", paste0(x.chr, ":", x.bp-10, "-", x.bp+10))
+  x.df <- do.call(rbind.data.frame, lapply(system(x.tab.query, intern=TRUE), FUN=function(TX){
+    unlist(strsplit(TX, split="\t", fixed=TRUE))
+  }))
+  
+  colnames(x.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+  x.df$CHR <- as.numeric(x.df$CHR)
+  x.df$BP <- as.numeric(x.df$BP)
+  x.df$logFC <- as.numeric(x.df$logFC)
+  x.df$SE <- as.numeric(x.df$SE)
+  x.df$GeneticVariance <- as.numeric(x.df$GeneticVariance)
+  x.df$SpatialFDR <- as.numeric(x.df$SpatialFDR)
+  x.df$Nhood <- as.numeric(x.df$Nhood)
+  
+  # only keep the FDR <= 1e-8, there are too many SNPs otherwise
+  x.df <- x.df[x.df$SpatialFDR <= 1e-8, ]
+  x.df <- merge(x.df, glmm.da.res[, c("Nhood", "ident", "ident_fraction", "NhoodGroup")])
+  x.df$LeadSNP <- x.lead
+  # only keep the lead SNP
+  x.df <- x.df[x.df$SNP == x.df$LeadSNP, , drop=FALSE]
+  gwas.list[[x.file]] <- x.df
+}
+
+gwas.hits.df <- do.call(rbind.data.frame, gwas.list)
+lead.snps <- unique(gwas.hits.df$LeadSNP)
+table(gwas.hits.df$ident) 
+```
+
+## Extracting proximal genes around each csQTL
+
+```{r, warning=FALSE, message=FALSE}
+# only consider protein-coding genes for this?
+biomaRt.connection <- useMart("ensembl", "hsapiens_gene_ensembl", host="grch37.ensembl.org",)
+
+gene.df <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "chromosome_name", 
+                                "strand", "start_position", "end_position", "gene_biotype"),
+                 mart=biomaRt.connection)
+rownames(gene.df) <- gene.df$ensembl_gene_id
+gene.df <- gene.df[!grepl(gene.df$gene_biotype, pattern="pseudogene"), ]
+gene.df <- gene.df[!gene.df$gene_biotype %in% c("artifact", "vault_RNA", "snoRNA", "snRNA", "sRNA", "scRNA", "scaRNA"),] # remove non-protein coding biotypes
+```
+
+We want to know which genes might be explaining each csQTL signal, and therefore use this information to gain biological insights. Current evidence suggests 
+that the nearest gene to a lead SNP is the best candidate causal gene in ~60% of cases. As the overlap with the Randolph _et al_. and eQTL Catalogue eQTLs 
+is extremely small I will test for cis-eQTLs in the individual csQTL neighbourhoods. These fine-grained eQTLs will then be used for colocalisation analysis to 
+identify the molecular mechanism underlying each csQTL.
+
+I will extract all genes with 1Mb of the lead SNP position.
+
+```{r}
+annot.list <- list()
+interval.size <- 500000L # 1Mb interval around the lead SNP
+
+for(i in seq_along(lead.snps)){
+  i.snp <- lead.snps[i]
+  i.bp <- unique(gwas.hits.df[gwas.hits.df$SNP %in% i.snp, ]$BP)
+  i.chr <- unique(gwas.hits.df[gwas.hits.df$SNP %in% i.snp, ]$CHR)
+  
+  # start with a 500kb interval around the SNP - extend out iff there are no genes found
+  i.start <- i.bp - interval.size
+  if(i.start < 1){
+    i.start < 1
+  }
+  
+  i.end <- i.bp + interval.size
+  
+  # get the genes in this interval (if any)
+  i.genes.plus <- gene.df[gene.df$chromosome_name %in% i.chr &
+                            (gene.df$start_position >= i.start & gene.df$end_position <= i.end) &
+                            gene.df$strand > 0, ]
+  i.genes.minus <- gene.df[gene.df$chromosome_name %in% i.chr &
+                             (gene.df$start_position <= i.start & gene.df$end_position >= i.end) &
+                             gene.df$strand < 0, ]
+  i.genes.in <- gene.df[gene.df$chromosome_name %in% i.chr &
+                          (i.start <= gene.df$start_position) & (i.end >= gene.df$end_position), ]
+  
+  i.genes <- do.call(rbind.data.frame, list(i.genes.plus, i.genes.minus, i.genes.in))
+  
+  if(nrow(i.genes)){
+  i.genes$LeadSNP <- i.snp
+  i.genes$SNP.Distance <- min(abs(c(i.genes$start_position - i.bp, i.genes$end_position - i.bp)))
+  } else{
+    i.genes <- data.frame(ensembl_gene_id=NA, external_gene_name=NA, chromosome_name=NA, strand=NA,
+                          start_position=NA, end_position=NA, gene_biotype=NA)
+    i.genes$LeadSNP <- i.snp
+    i.genes$SNP.Distance <- NA
+  }
+  
+  annot.list[[i.snp]] <- i.genes
+}
+
+snp.annot.df <- do.call(rbind.data.frame, annot.list)
+```
+
+What is the average distance from each SNP to gene? 
+
+```{r}
+ggplot(snp.annot.df, aes(x=gene_biotype, y=SNP.Distance)) +
+  geom_boxplot() +
+  scale_y_log10(breaks=c(1e1, 1e2, 1e3, 1e4, 1e5, 1e6)) +
+  theme_cowplot() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+  expand_limits(y=c(1)) +
+  NULL
+```
+The average distance is very similar across biotypes, including protein-coding genes, and is ~10Kb. For each SNP how many genes are there within 1Mb?
+
+```{r}
+snp.gene.count <- snp.annot.df %>% group_by(LeadSNP, gene_biotype) %>% summarise(NGenes=n())
+
+ggplot(snp.gene.count, aes(x=gene_biotype, y=NGenes)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+  NULL
+```
+
+For each SNP I will compute the total genomic locus that includes +/- 1MB around each gene, and use these co-ordinates to extract the relevant genotype data across individuals for the eQTL 
+analysis. These will be indexed by the lead SNP for the csQTL.
+
+```{r}
+window <- 1e6
+genomic.coords <- list()
+for(x in seq_along(lead.snps)){
+  x.snp <- lead.snps[x]
+  x.starts <- snp.annot.df[snp.annot.df$LeadSNP %in% x.snp, ]$start_position
+  x.ends <- snp.annot.df[snp.annot.df$LeadSNP %in% x.snp, ]$end_position
+  # we use both start and ends as we don't care about strand and just need the extremes of the coordinates
+
+  x.left <- min(abs(c(x.starts - window/2, x.ends - window/2)))
+  x.right <- max(abs(c(x.starts + window/2, x.ends + window/2)))
+  
+  genomic.coords[[x.snp]] <- data.frame("LeadSNP"=x.snp, "Start"=x.left, "End"=x.right)
+}
+
+gene.coord.df <- do.call(rbind.data.frame, genomic.coords)
+write.table(gene.coord.df, file="~/Dropbox/GLMM/results/csQTL_GenomicCoords.tsv",
+            row.names=FALSE, sep="\t", quote=FALSE)
+
+print(sum(is.na(gene.coord.df$Start)))
+gene.coord.df[is.na(gene.coord.df$Start), ]
+```
+
+There are 4 csQTLs in gene deserts, i.e. there are no annotated genes within 1Mb of the lead SNP.
+
+How big are these loci?
+
+```{r}
+ggplot(na.omit(gene.coord.df), aes(x=abs(Start - End))) +
+  geom_histogram(binwidth=0.01, colour='black') +
+  theme_cowplot() +
+  scale_x_log10() +
+  labs(x="Locus size (bp)") +
+  NULL
+```
+
+Most loci are approaching 2Mb, which makes sense as this is the maximal size, i.e. a gene is 1Mb from the csQTL SNP and it then has a 1Mb interval around it's most distal point.
+
+# Matrix eQTL testing
+
+## Preparing data files
+
+I've filtered the genotype data on MAF >= 15% to match the csQTL testing. Each genotype file covers a single locus with a few thousand SNPs in each. SNPs are in the rows and sample names are 
+in the columns. Below is an example of one of these files.
+
+```{r}
+# for tmpfiles
+tmp.dir <- tempdir(check=TRUE)
+
+test.geno <- read.table("~/Dropbox/GLMM/subset_genotype.dir/1_112105176_A_C.traw",
+                        header=TRUE, stringsAsFactors=FALSE, sep="\t")
+colnames(test.geno) <- gsub(colnames(test.geno), pattern="(\\S+)_(\\S+)", replacement="\\1")
+l.snp <- "1_112105176_A_C"
+test.geno <- test.geno[, !colnames(test.geno) %in% c("CHR", "X.C.M", "POS", "COUNTED", "ALT")]
+
+geno.tmp <- tempfile(pattern=paste0(l.snp, "_genotype"), tmpdir=tmp.dir, fileext=".tsv")
+write.table(test.geno, file=geno.tmp, sep="\t", col.names=TRUE, row.names=FALSE, quote=FALSE)
+
+head(test.geno[, c(1:10)])
+```
+
+The file contains SNP position and allele information - matrix eQTL doesn't need this information so it will be dropped. I'll do this with temp files so I don't duplicate data and waste 
+storage space.
+
+The gene expression data for each locus needs to be a matrix of the local genes to be tested.
+
+```{r}
+# for each nhood compute the pseudobulk expression over samples.
+locus.genes <- snp.annot.df[snp.annot.df$LeadSNP %in% c("1_112105176_A_C"), ]$external_gene_name
+test.nhoods <- unique(gwas.hits.df[gwas.hits.df$LeadSNP %in% c("1_112105176_A_C"),]$Nhood) # I need to decide if this is just the Nhood or the whole NhoodGroup? Former for now.
+
+cellxsamp <- model.matrix(~0+SOC_indiv_ID, data=colData(rand.ni.milo))
+colnames(cellxsamp) <- gsub(colnames(cellxsamp), pattern="SOC_indiv_ID", replacement="")
+cellxsamp <- cellxsamp[, colnames(cellxsamp) %in% colnames(test.geno)]
+nhood.exprs.list <- list()
+
+
+for(i in seq_along(test.nhoods)){
+  i.nh <- test.nhoods[i]
+  i.idx <- as.character(nhoodIndex(rand.ni.milo)[[i.nh]])
+  i.cellxnh <- nhoods(rand.ni.milo)[, i.idx, drop=FALSE]
+  i.cells <- rownames(i.cellxnh)[rowSums(i.cellxnh) > 0]
+  i.cellxsamp <- cellxsamp[i.cells, , drop=FALSE]
+  i.csums <- colSums(i.cellxsamp)
+  
+  # compute pseudobulk
+  i.ps <- counts(rand.ni.milo[rownames(rand.ni.milo) %in% locus.genes, i.cells, drop=FALSE]) %*% i.cellxsamp
+  i.ps <- t(apply(i.ps, 1, FUN=function(GX) log((GX+1)/(i.csums+1))))
+  i.ps[is.na(i.ps)] <- 0
+  i.ps <- do.call(cbind.data.frame, list("Genes"=rownames(i.ps), i.ps))
+  rownames(i.ps) <- NULL
+  
+  i.tmpname <- tempfile(pattern=paste0(i.nh, "_expression"), tmpdir=tmp.dir, fileext=".tsv")
+  write.table(i.ps, file=i.tmpname, row.names=FALSE, sep="\t", quote=FALSE, col.names=TRUE)
+  nhood.exprs.list[[paste0(i.nh)]] <- i.tmpname
+}
+
+head(i.ps[, c(1:10)])
+```
+
+This is a snapshot of the gene expression matrix for a single neighbourhood. We also need a file of the covariates.
+
+```{r}
+samp.meta <- dplyr::distinct(rand.ni.meta, SOC_indiv_ID, .keep_all=TRUE)
+samp.meta <- samp.meta[, !colnames(samp.meta) %in% c("CellID", "UMAP1", "UMAP2", "sizeFactor")]
+samp.meta <- samp.meta[samp.meta$SOC_indiv_ID %in% colnames(i.ps), ]
+
+# covariates must be numeric - use the proportion of YRI ancestry as the covariate
+samp.covar <- as.data.frame(t(samp.meta[, c("SOC_indiv_ID", "YRI")]))
+
+covar.fname <- "~/Dropbox/GLMM/results/Randolph_MockInf-MatrixeQTL_covar.tsv"
+write.table(samp.covar, file=covar.fname,
+            sep="\t", col.names=FALSE, row.names=TRUE, quote=FALSE, )
+```
+
+I've written the example test files to the relevant tempfiles for analysis.
+
+## eQTL analysis
+
+First we setup the configuration for running Matrix eQTL.
+
+```{r}
+use.model <- modelLINEAR
+snp.file.name <- geno.tmp
+exprs.file.name <- nhood.exprs.list[[1]] # pick the first nhood for illustrative purposes
+covar.file.name <- covar.fname
+out.filename <- tempfile(pattern=paste0(i.nh, "_", l.snp, "_MatrixEQTL"), fileext="tsv", tmpdir=tmp.dir)
+pval.thresh <- 1 # keep all results
+err.covar <- numeric() # an additional covariance term - this is the default setting, i.e. the identity matrix (or some multiple thereof)
+```
+
+
+```{r}
+snps.obj <- SlicedData$new() # create a new sliced data object for storing SNPs
+snps.obj$fileDelimiter <- "\t"      # the TAB character
+snps.obj$fileOmitCharacters <- "NA" # denote missing values;
+snps.obj$fileSkipRows <- 1        # one row of column labels
+snps.obj$fileSkipColumns <- 1       # one column of row labels
+snps.obj$fileSliceSize <- 500  # read file in pieces of 500 rows, most analyses will only be run with 2-3 of these
+snps.obj$LoadFile(snp.file.name)
+
+## Load gene expression data
+gene.obj = SlicedData$new();
+gene.obj$fileDelimiter = "\t";      # the TAB character
+gene.obj$fileOmitCharacters = "NA"; # denote missing values;
+gene.obj$fileSkipRows = 1;          # one row of column labels
+gene.obj$fileSkipColumns = 1;       # one column of row labels
+gene.obj$fileSliceSize = 500;      # read file in slices of 2,000 rows
+gene.obj$LoadFile(exprs.file.name);
+
+## Load covariates
+covar.obj = SlicedData$new();
+covar.obj$fileDelimiter = "\t";      # the TAB character
+covar.obj$fileOmitCharacters = "NA"; # denote missing values;
+covar.obj$fileSkipRows = 1;          # one row of column labels
+covar.obj$fileSkipColumns = 1;       # one column of row labels
+covar.obj$LoadFile(covar.file.name);
+```
+Now we have the SNP data stored efficiently we can perform our eQTL analysis.
+
+```{r}
+me.test <- Matrix_eQTL_engine(snps = snps.obj,
+                              gene = gene.obj,
+                              cvrt = covar.obj,
+                              output_file_name = out.filename,
+                              pvOutputThreshold = pval.thresh,
+                              useModel = use.model,
+                              errorCovariance = err.covar,
+                              verbose = TRUE,
+                              pvalue.hist = TRUE,
+                              min.pv.by.genesnp = FALSE,
+                              noFDRsaveMemory = FALSE)
+unlink(out.filename)
+```
+
+Now we can plot the results for this nhood and any identified eQTLs.
+
+```{r}
+## Results:
+cat('Analysis done in: ', me.test$time.in.sec, ' seconds', '\n');
+cat('Detected eQTLs:', '\n');
+show(me.test$all$eqtls)
+```
+
+These are the SNP-eGene eQTL results, for which we can see the FDR values are all quite high indicating a general lack of eQTLs. This might be a power issue.
+
+```{r, pvalue histogram}
+## Plot the histogram of all p-values
+plot(me.test)
+```
+
+There is a slight hilling of p-values, but probably not enough to convince me of solid eQTL signals here.
+
+```{r}
+# which genes are expressed in the nhoods and what number/proportion of proximal genes is this?
+all.locus.genes <- unique(snp.annot.df$external_gene_name)
+print(length(all.locus.genes))
+
+all.loc.exprs <- nhoodExpression(rand.ni.milo)[rownames(rand.ni.milo) %in% all.locus.genes, ]
+sum(rowMeans(all.loc.exprs) > 0)
+sum(rowMeans(all.loc.exprs) > 0)/length(all.locus.genes)
+
+# how many are expressed in all nhoods?
+sum(rowSums(all.loc.exprs > 0) == ncol(all.loc.exprs))
+```
+
+There are `r length(all.locus.genes)` proximal genes, of which `r sum(rowMeans(all.loc.exprs) > 0)` are expressed in at least 1 nhood.
+
+
+Now that we have a way to do the analysis, we can do this over all csQTLs and proximal genes.
+
+# The big eQTL analysis
+
+```{r, "big matrix eQTL analysis", message=FALSE}
+# for tmpfiles
+tmp.dir <- tempdir(check=TRUE)
+matrixqtl.list <- list()
+
+## global config
+use.model <- modelLINEAR
+pval.thresh <- 1 # keep all results
+err.covar <- numeric() # an additional covariance term - this is the default setting, i.e. the identity matrix (or some multiple thereof)
+covar.file.name <- covar.fname
+
+## Load covariates
+covar.obj = SlicedData$new();
+covar.obj$fileDelimiter = "\t";      # the TAB character
+covar.obj$fileOmitCharacters = "NA"; # denote missing values;
+covar.obj$fileSkipRows = 1;          # one row of column labels
+covar.obj$fileSkipColumns = 1;       # one column of row labels
+covar.obj$LoadFile(covar.file.name);
+
+# exclude the SNPs with no proximal genes
+geno.snps <- gsub(list.files("~/Dropbox/GLMM/subset_genotype.dir/", pattern="traw"),
+                  pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)(\\.traw)",
+                  replacement="\\1_\\2_\\3_\\4")
+
+eqtl.snps <- intersect(lead.snps, geno.snps)
+
+# this is used later for colocalisation analysis - the standard deviations 
+# of gene expression for each gene in each nhood
+nh.exprs.sd <- list()
+n.genes.on.list <- list() # capture how many genes are at the locus and how many are expressed in each nhood
+
+
+for(x in seq_along(eqtl.snps)){
+  x.snp <- eqtl.snps[x]
+  ###--- genotype data ---###
+  x.geno <- read.table(paste0("~/Dropbox/GLMM/subset_genotype.dir/", x.snp, ".traw"),
+                          header=TRUE, stringsAsFactors=FALSE, sep="\t")
+  colnames(x.geno) <- gsub(colnames(x.geno), pattern="(\\S+)_(\\S+)", replacement="\\1")
+  x.geno <- x.geno[, !colnames(x.geno) %in% c("CHR", "X.C.M", "POS", "COUNTED", "ALT")]
+  x.geno.tmp <- tempfile(pattern=paste0(x.snp, "_genotype"), tmpdir=tmp.dir, fileext=".tsv")
+  write.table(x.geno, file=x.geno.tmp, sep="\t", col.names=TRUE, row.names=FALSE, quote=FALSE)
+  
+  ###--- gene expression data ---###
+  x.locus.genes <- snp.annot.df[snp.annot.df$LeadSNP %in% c(x.snp), ]$external_gene_name
+  x.nhoods <- unique(gwas.hits.df[gwas.hits.df$LeadSNP %in% c(x.snp),]$Nhood) # I need to decide if this is just the Nhood or the whole NhoodGroup? Former for now.
+  
+  x.cellxsamp <- model.matrix(~0+SOC_indiv_ID, data=colData(rand.ni.milo))
+  colnames(x.cellxsamp) <- gsub(colnames(x.cellxsamp), pattern="SOC_indiv_ID", replacement="")
+  x.cellxsamp <- x.cellxsamp[, colnames(x.cellxsamp) %in% colnames(x.geno)]
+  
+  for(i in seq_along(x.nhoods)){
+    i.nh <- x.nhoods[i]
+    i.idx <- as.character(nhoodIndex(rand.ni.milo)[[i.nh]])
+    i.cellxnh <- nhoods(rand.ni.milo)[, i.idx, drop=FALSE]
+    i.cells <- rownames(i.cellxnh)[rowSums(i.cellxnh) > 0]
+    i.cellxsamp <- x.cellxsamp[i.cells, , drop=FALSE]
+    i.csums <- colSums(i.cellxsamp)
+    
+    # compute pseudobulk
+    if(sum(rownames(rand.ni.milo) %in% x.locus.genes)){
+      i.ps <- counts(rand.ni.milo[rownames(rand.ni.milo) %in% x.locus.genes, i.cells, drop=FALSE]) %*% i.cellxsamp
+      i.ps <- t(apply(i.ps, 1, FUN=function(GX) log((GX+1)/(i.csums+1))))
+      i.ps[is.na(i.ps)] <- 0
+      
+      n.is.exprs <- sum(rowMeans(i.ps) > 0)
+      n.genes.on.list[[paste0(i.nh, "_", x.snp)]] <- data.frame("Nhood"=i.nh, "LeadSNP"=x.snp, "N.Proximal"=length(x.locus.genes),
+                                                                "N.Genes.Exprs"=n.is.exprs)
+      
+      i.ps <- do.call(cbind.data.frame, list("Genes"=rownames(i.ps), i.ps))
+      rownames(i.ps) <- NULL
+      
+      i.sd <- apply(i.ps[, c(2:ncol(i.ps))], 1, sd) # drop the Genes columns
+      names(i.sd) <- i.ps$Genes
+      nh.exprs.sd[[paste0(i.nh, "_", x.snp)]] <- i.sd
+      
+      
+      i.tmpname <- tempfile(pattern=paste0(i.nh, "_expression"), tmpdir=tmp.dir, fileext=".tsv")
+      write.table(i.ps, file=i.tmpname, row.names=FALSE, sep="\t", quote=FALSE, col.names=TRUE)
+      nhood.exprs.list[[paste0(i.nh)]] <- i.tmpname
+      
+      exprs.file.name <- i.tmpname # pick the first nhood for illustrative purposes
+      i.out.filename <- tempfile(pattern=paste0(i.nh, "_", x.snp, "_MatrixEQTL"), fileext="tsv", tmpdir=tmp.dir)
+      
+      i.snps.obj <- SlicedData$new() # create a new sliced data object for storing SNPs
+      i.snps.obj$fileDelimiter <- "\t"      # the TAB character
+      i.snps.obj$fileOmitCharacters <- "NA" # denote missing values;
+      i.snps.obj$fileSkipRows <- 1        # one row of column labels
+      i.snps.obj$fileSkipColumns <- 1       # one column of row labels
+      i.snps.obj$fileSliceSize <- 500  # read file in pieces of 500 rows, most analyses will only be run with 2-3 of these
+      i.snps.obj$LoadFile(x.geno.tmp)
+      
+      ## Load gene expression data
+      i.gene.obj = SlicedData$new();
+      i.gene.obj$fileDelimiter = "\t";      # the TAB character
+      i.gene.obj$fileOmitCharacters = "NA"; # denote missing values;
+      i.gene.obj$fileSkipRows = 1;          # one row of column labels
+      i.gene.obj$fileSkipColumns = 1;       # one column of row labels
+      i.gene.obj$fileSliceSize = 500;      # read file in slices of 2,000 rows
+      i.gene.obj$LoadFile(i.tmpname);
+      
+      i.me.test <- Matrix_eQTL_engine(snps = i.snps.obj,
+                                      gene = i.gene.obj,
+                                      cvrt = covar.obj,
+                                      output_file_name = i.out.filename,
+                                      pvOutputThreshold = pval.thresh,
+                                      useModel = use.model,
+                                      errorCovariance = err.covar,
+                                      verbose = TRUE,
+                                      pvalue.hist = TRUE,
+                                      min.pv.by.genesnp = FALSE,
+                                      noFDRsaveMemory = FALSE)
+      unlink(i.out.filename)
+      i.res <- i.me.test$all$eqtls # results table
+      i.res$LeadSNP <- x.snp
+      i.res$Nhood <- i.nh
+      matrixqtl.list[[paste0(i.nh, x.snp)]] <- i.res
+      
+      # tidyup and remove temp files
+      file.remove(c(i.tmpname))
+    }
+  }
+  file.remove(x.geno.tmp)
+}
+
+# file.remove(list.files(tmp.dir, pattern="expression", full.names=TRUE))
+# file.remove(list.files(tmp.dir, pattern="genotype", full.names=TRUE))
+
+matrix.qtl.df <- do.call(rbind.data.frame, matrixqtl.list)
+hist(matrix.qtl.df$FDR, xlab="FDR", main="Histogram of eQTL FDR")
+```
+
+This is the histogram of FDRs, baring in mind that we have retained the results for all SNP-Gene tests. Do we have any eQTLs, and if so which csQTLs do these correspond to?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.5, fig.width=3.5}
+matrix.eqtl.summary <- matrix.qtl.df %>% group_by(LeadSNP, Nhood, gene) %>% summarise(NHits=sum(FDR < 0.01))
+
+ggplot(matrix.eqtl.summary, aes(x=NHits)) +
+  geom_histogram(colour='black') +
+  theme_cowplot() +
+  labs(x="#eSNPs", y="Count") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/MatrixeQTL-NeSNPs-histogram.png",
+       height=2.5, width=3.5, dpi=300, bg='white')
+```
+
+For some csQTLs there are a lot of associated eSNPs. The next step will be to identify which of these correspond to unique signals.
+
+```{r}
+egenes <- unique(matrix.qtl.df[matrix.qtl.df$FDR < 0.01, ]$gene)
+esnp.csqtls <- nrow(distinct(matrix.qtl.df[matrix.qtl.df$FDR < 0.01, c("Nhood", "LeadSNP")]))
+esnp.csqtls
+length(egenes)
+```
+
+At a 1% FDR threshold there are 449 distinct eGenes across 121 csQTLs. This should be visualised at a range of FDR thresholds; I expect diminishing numbers of significant eQTLs.
+
+```{r, fig.height=3.5, fig.width=4}
+eqtl.thres.list <- list()
+thresh.vec <- c(0.1, 0.05, 0.01, 0.005, 0.001, 1e-4)
+
+for(q in seq_along(thresh.vec)){
+  q.thresh <- thresh.vec[q]
+  q.egenes <- length(unique(matrix.qtl.df[matrix.qtl.df$FDR < q.thresh, ]$gene))
+  q.csqtls <- nrow(distinct(matrix.qtl.df[matrix.qtl.df$FDR < q.thresh, c("Nhood", "LeadSNP")]))
+  eqtl.thres.list[[q]] <- data.frame("N.eGenes"=q.egenes, "N.csQTLs"=q.csqtls, "FDR"=q.thresh)
+}
+
+eqtl.thresh.df <- do.call(rbind.data.frame, eqtl.thres.list)
+eqtl.thresh.df$FDR <- factor(eqtl.thresh.df$FDR,
+                             levels=thresh.vec)
+
+ggplot(eqtl.thresh.df, aes(x=FDR, y=N.csQTLs)) +
+  geom_bar(colour='black', stat='identity') +
+  geom_text(aes(label=N.csQTLs), nudge_y=15, family="Roboto") +
+  theme_cowplot() +
+  labs(x="FDR", y="#csQTLs with \u22651 eQTLs") +
+  theme(text=element_text(family="Roboto")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/MatrixeQTL_FDRvsNeQTLsincsQTLs-barplot.png",
+      height=3.5, width=4, dpi=300, bg='white')
+```
+
+
+```{r, fig.height=3.5, fig.width=4}
+ggplot(eqtl.thresh.df, aes(x=FDR, y=N.eGenes)) +
+  geom_bar(colour='black', stat='identity') +
+  geom_text(aes(label=N.eGenes), nudge_y=50, family="Roboto") +
+  theme_cowplot() +
+  labs(x="FDR", y="#eGenes") +
+  theme(text=element_text(family="Roboto")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/MatrixeQTL_FDRvsNeGenes-barplot.png",
+      height=3.5, width=4, dpi=300, bg='white')
+```
+
+
+```{r}
+write.table(matrix.qtl.df,
+            file="~/Dropbox/GLMM/results/MatrixEQTL_results-csQTLs.tsv",
+            quote=FALSE, row.names=FALSE, sep="\t")
+
+saveRDS(nh.exprs.sd, file="~/Dropbox/GLMM/results/Pseudobulk_SDs.RDS")
+```
+
+
+# csQTL - eQTL colocalisation
+
+Looping over the csQTLs and extracting the relevant SNPs can be computationally expensive. Therefore, I've run the colocalisation analysis on the cluster separately and 
+review/summarise the results here.
+
+```{r, eval=FALSE}
+# compute the nhood standard deviations
+rand.ni.sd <- apply(nhoodCounts(rand.ni.milo), 1, sd) # these are numbered sequentially
+```
+
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+# this code is here for reference - this analysis was run on the HPC
+eqtl.csqtl.coloc.list <- list()
+
+# eqtl.snps are the ones that are _not_ in gene deserts
+for(x in seq_along(eqtl.snps)){
+  x.snp <- eqtl.snps[x]
+  x.eqtls <- matrix.qtl.df[matrix.qtl.df$LeadSNP %in% x.snp, ]
+  x.eqtls$BP <- as.numeric(gsub(x.eqtls$snps, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", 
+                                replacement="\\2"))
+  x.egenes <- unique(x.eqtls[x.eqtls$FDR < 0.01, ]$gene)
+  x.nhoods <- unique(x.eqtls[x.eqtls$FDR < 0.01, ]$Nhood)
+  x.esnps <- unique(x.eqtls$snps)
+  
+  if(length(x.egenes) & length(x.nhoods)){
+    x.chr <- gsub(x.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", 
+                  replacement="\\1")
+    x.bp <- as.numeric(gsub(x.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", 
+                            replacement="\\2"))
+    x.csqtl.file <- gwas.files[grepl(gwas.files, pattern=x.snp)] # these are from the first code block in this notebook
+    x.tabix.query <- paste0("tabix ", x.csqtl.file, " ", x.chr, ":", x.bp-interval.size, "-", x.bp+interval.size) # interval size is also from above
+    x.csqtl.df <- do.call(rbind.data.frame, lapply(system(x.tabix.query, intern=TRUE), FUN=function(TX){
+      unlist(strsplit(TX, split="\t", fixed=TRUE))
+      }))
+    
+    colnames(x.csqtl.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+    x.csqtl.df$CHR <- as.numeric(x.csqtl.df$CHR)
+    x.csqtl.df$BP <- as.numeric(x.csqtl.df$BP)
+    x.csqtl.df$logFC <- as.numeric(x.csqtl.df$logFC)
+    x.csqtl.df$SE <- as.numeric(x.csqtl.df$SE)
+    x.csqtl.df$GeneticVariance <- as.numeric(x.csqtl.df$GeneticVariance)
+    x.csqtl.df$SpatialFDR <- as.numeric(x.csqtl.df$SpatialFDR)
+    x.csqtl.df$Nhood <- as.numeric(x.csqtl.df$Nhood)
+    x.csqtl.df <- x.csqtl.df[x.csqtl.df$SNP %in% x.esnps, ]
+    
+    for(q in seq_along(x.nhoods)){
+      q.nh <- x.nhoods[q]
+      q.csqtl <- x.csqtl.df[x.csqtl.df$Nhood %in% q.nh, ]
+      
+      x.coloc.list <- list("beta"=q.csqtl$logFC, "varbeta"=(q.csqtl$SE)**2,
+                           "snp"=q.csqtl$SNP, "position"=q.csqtl$BP,
+                           "type"="quant", "sdY"=rand.ni.sd[q.nh])
+      
+      for(k in seq_along(x.egenes)){
+        k.gene <- x.egenes[k]
+        k.sd <- (nh.exprs.sd[[paste0(q.nh, "_", x.snp)]])[k.gene]
+        k.eqtls <- x.eqtls[x.eqtls$gene %in% k.gene & x.eqtls$snps %in% q.csqtl$SNP, ]
+        k.eqtls <- k.eqtls[!duplicated(k.eqtls$snps), ]
+        
+        k.eqtl.coloc.list <- list("beta"=k.eqtls$beta,
+                                  "varbeta"=(k.eqtls$beta/k.eqtls$statistic)**2,
+                                  "snp"=k.eqtls$snps,
+                                  "position"=k.eqtls$BP,
+                                  "type"="quant", "sdY"=k.sd)
+        
+        # check coloc validity
+        if(is.null(check_dataset(k.eqtl.coloc.list)) & is.null(check_dataset(x.coloc.list))){
+          k.coloc <- coloc.abf(x.coloc.list, k.eqtl.coloc.list)
+          k.df <- do.call(cbind.data.frame, as.list(k.coloc$summary))  
+          k.df$Nhood <- q.nh
+          k.df$Gene <- k.gene
+          k.df$LeadSNP <- x.snp
+          
+          k.ppsum <- sum(k.df[c(2:6)])
+          if(k.ppsum > 1){
+            warning("PP sum > 1 for ", k.gene, " in nhood ", q.nh, " for SNP ", x.snp)
+          }
+          
+          eqtl.csqtl.coloc.list[[paste0(x.snp, "_", q.nh, "_", k.gene)]] <- k.df
+          
+        }
+        
+      }
+    }
+  }
+}
+
+csqtl.eqtl.coloc.df <- do.call(rbind.data.frame, eqtl.csqtl.coloc.list)
+# merge with Randolph cell type annotations
+csqtl.eqtl.coloc.df <- merge(csqtl.eqtl.coloc.df, glmm.da.res[, c("Nhood", "NhoodGroup", "ident", "ident_fraction")], by="Nhood", all.x=TRUE)
+```
+
+Load in the colocalisation results between the 121 pairs of csQTLs.
+
+```{r}
+csqtl.eqtl.coloc.df <- read.table("~/Dropbox/GLMM/results/MiloGWAS__MatrixQTLcoloc.tsv",
+                                  sep="\t", header=TRUE, stringsAsFactors=FALSE)
+```
+
+Firstly, do we see much colocalisation, and how many eQTLs are colocalised with each csQTL?
+
+```{r}
+ggplot(csqtl.eqtl.coloc.df, aes(x=PP.H4.abf)) +
+  geom_histogram(colour='black', binwidth=0.05) +
+  theme_cowplot() +
+  labs(x="PP H4", y="#csQTL-eQTL pairs") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/MatrixeQTL-coloc-PP4-histogram.png",
+       height=3, width=4.5, dpi=300, bg='white')
+```
+
+```{r}
+length(unique(csqtl.eqtl.coloc.df[csqtl.eqtl.coloc.df$PP.H4.abf >= 0.75, ]$csQTL))
+```
+
+
+There is a strong skew towards csQTLs with colocalised eQTLs - that bodes well (also there is clearly a selection bias in this analysis).  Which genes are colocalised with 
+which csQTLs?
+
+```{r, fig.height=5, fig.width=6}
+csqtl.eqtl.coloc.df$CHR <- as.numeric(gsub(csqtl.eqtl.coloc.df$LeadSNP, pattern="([0-9+])_([0-9]+)_([ATCG]+)_([ATCG])",
+                                    replacement="\\1"))
+csqtl.eqtl.coloc.df$CHR.Fac <- factor(csqtl.eqtl.coloc.df$CHR, levels=c(1:19))
+csqtl.eqtl.coloc.df$BP <- as.numeric(gsub(csqtl.eqtl.coloc.df$LeadSNP, pattern="([0-9+])_([0-9]+)_([ATCG]+)_([ATCG])",
+                                    replacement="\\2"))
+csqtl.eqtl.coloc.df$csQTL <- paste(paste0("Nh", csqtl.eqtl.coloc.df$Nhood), csqtl.eqtl.coloc.df$LeadSNP, sep=":")
+csqtl.eqtl.coloc.df$Gene.Fac <- factor(csqtl.eqtl.coloc.df$Gene,
+                                       levels=unique(csqtl.eqtl.coloc.df$Gene)[order(unique(csqtl.eqtl.coloc.df$Gene), decreasing=TRUE)])
+
+# remove genes with no eQTLs
+keep.egenes <- unique(csqtl.eqtl.coloc.df$Gene[csqtl.eqtl.coloc.df$PP.H4.abf >= 0.75])
+# ct.cols <- pal_npg()(2)
+# csqtl.eqtl.coloc.df$CT.Col <- ifelse(csqtl.eqtl.coloc.df$ident == "CD8_T", ct.cols[1], ct.cols[2])
+# csqtl.ct <- csqtl.eqtl.coloc.df$CT.Col[csqtl.eqtl.coloc.df$Gene %in% keep.egenes]
+# csqtl.ct <- csqtl.ct[order(csqtl.eqtl.coloc.df[csqtl.eqtl.coloc.df$Gene %in% keep.egenes, ]$BP)]
+
+ggplot(csqtl.eqtl.coloc.df[csqtl.eqtl.coloc.df$Gene %in% keep.egenes, ], 
+       aes(x=reorder(csQTL, CHR), 
+           y=Gene.Fac, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks=element_blank(),
+        axis.text.y=element_blank(),
+        text=element_text(family="Roboto", size=16)) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1, breaks=c(0, 0.5, 1), limits=c(0, 1)) +
+  # facet_wrap(~CHR.Fac, scales="free", ncol=7) +
+  labs(x="csQTLs", y="eGenes") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/MatrixeQTL-coloc-heatmap.png",
+       height=5, width=6, dpi=300, bg='white')
+```
+
+It would help to integrate these colocalised eQTs with the GWAS coloc analysis and link the 3 together. I'll do this in a separate notebook as I want to bring together PanUKBB, FinnGen and 
+GWAS catalogue results.
+
+```{r}
+write.table(csqtl.eqtl.coloc.df, file="~/Dropbox/GLMM/results/CellState_eQTL_coloc.tsv",
+            sep="\t", quote=FALSE, row.names = FALSE)
+```
+
+
+# Visualise example csQTL - cell state eQTLs
+
+We want to select a few interesting examples of csQTLs that colocalise with eQTLs. We can produce locus zoom plots and boxplots of the expression vs. SNP alleles as well.
+I'll pick out a few interesting genes such as STAT3, STAT5A, etc.
+
+```{r}
+tcell.goi <- c("C1QTNF1", "HLA-G", "MTHFD1", "PTPN11", "SH2B3", "SOCS5", "STAT3", "STAT5A", "STAT5B", "TRAFD1")
+mono.goi <- c("APOE", "CDK4", "NFATC1", "SOCS6", "TSLP", "ARID3B")
+```
+
+I've selected these genes partly on the fact they are linked to immune cell function and partly because they are involved in gene expression regulation or other interesting biological processes.
+
+```{r}
+# plots of gene expression across all nhoods (i.e. on the UMAP)
+# and by csQTL Lead SNP genotype (i.e. boxplots)
+# add the expression of these genes to the colData
+gene.goi <- as.data.frame(as.matrix(t(logcounts(rand.ni.milo[rownames(rand.ni.milo) %in% c(tcell.goi, mono.goi), ]))))
+rownames(gene.goi) <- colnames(rand.ni.milo)
+
+for(k in seq_along(colnames(gene.goi))){
+  k.gene <- colnames(gene.goi)[k]
+  colData(rand.ni.milo)[, k.gene] <- gene.goi[, k.gene]
+}
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+all.goi <- c(tcell.goi, mono.goi)
+
+for(q in seq_along(all.goi)){
+  q.gene <- all.goi[q]
+  
+  if(q.gene %in% colnames(colData(rand.ni.milo))){
+      p.plot <- plotNhoodGraph(rand.ni.milo, layout="UMAP", colour_by=q.gene) +
+          scale_fill_viridis(option="plasma") +
+          guides(fill=guide_colorbar(title=q.gene)) +
+          NULL
+      
+      p.file <- paste0("~/Dropbox/GLMM/plots/RandolphUMAPs/Randolph_GWAS-", q.gene, "_NhoodUMAP.png")
+      ggsave(plot=p.plot, filename=p.file, height=4.5, width=6.5, dpi=300)
+      
+      # single-cell UMAP?
+      p.df <- cbind.data.frame(rand.ni.meta, colData(rand.ni.milo)[, c(q.gene), drop=FALSE])
+      p.df <- p.df[, c("UMAP1", "UMAP2", q.gene), drop=FALSE]
+      colnames(p.df) <- c("UMAP1", "UMAP2", "Gene")
+    
+      p.sc.plot <- ggplot(p.df, aes(x=UMAP1, y=UMAP2)) +
+        geom_point_rast(data=p.df[p.df$Gene == 0, ], colour='grey80', raster.dpi=300) +
+        geom_point_rast(data=p.df[p.df$Gene > 0, ], mapping=aes(colour=Gene), raster.dpi=300) +
+        theme_cowplot() +
+        scale_colour_viridis(option="plasma") +
+        guides(colour=guide_colorbar(title=q.gene)) +
+        NULL
+      
+      p.file <- paste0("~/Dropbox/GLMM/plots/RandolphUMAPs/Randolph_GWAS-", q.gene, "_scUMAP.png")
+      ggsave(plot=p.sc.plot, filename=p.file, height=4.5, width=6.5, dpi=300, bg='white')
+  }
+}
+```
+
+I will also overlay the eQTL and csQTL lead SNP effect sizes on these UMAPs to show the correspondence between expression and genetic effects. We also want to visualise the relationship between 
+expression and genotype for each of these eGenes and the lead csQTL SNPs.
+
+```{r, warning=FALSE, message=FALSE, fig.height=3, fig.width=2.5}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+all.goi <- c(tcell.goi, mono.goi)
+
+for(q in seq_along(all.goi)){
+  q.gene <- all.goi[q]
+  
+  # retrieve the lead SNPs
+  q.snp <- unique(csqtl.eqtl.coloc.df$LeadSNP[csqtl.eqtl.coloc.df$Gene %in% q.gene])
+  
+  for(k in seq_along(q.snp)){
+    k.snp <- q.snp[k]
+    
+    # extract the eQTL summary statistics for this gene
+    q.eqtl <- matrix.qtl.df[matrix.qtl.df$snps %in% k.snp & matrix.qtl.df$gene %in% q.gene, ]
+    
+    q.file <- gwas.files[grepl(gwas.files, pattern=k.snp)]
+    q.lead <- gsub(q.file, pattern="([[:ascii:]]*)/(chr[0-9]+)/([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)(_locus\\.tsv\\.gz)", 
+                   replacement="\\3_\\4_\\5_\\6", perl=TRUE)
+    q.chr <- gsub(k.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1")
+    q.bp <- as.numeric(gsub(k.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+    
+    # tabix this for speed
+    q.tab.query <- paste0("tabix ", q.file, " ", paste0(q.chr, ":", q.bp-10, "-", q.bp+10))
+    q.df <- do.call(rbind.data.frame, lapply(system(q.tab.query, intern=TRUE), FUN=function(TX){
+      unlist(strsplit(TX, split="\t", fixed=TRUE))
+    }))
+    
+    colnames(q.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+    q.df$CHR <- as.numeric(q.df$CHR)
+    q.df$BP <- as.numeric(q.df$BP)
+    q.df$logFC <- as.numeric(q.df$logFC)
+    q.df$SE <- as.numeric(q.df$SE)
+    q.df$GeneticVariance <- as.numeric(q.df$GeneticVariance)
+    q.df$SpatialFDR <- as.numeric(q.df$SpatialFDR)
+    q.df$Nhood <- as.numeric(q.df$Nhood)
+    
+    # add csQTL results to nhoods 
+    q.plot <- plotNhoodGraphDA(rand.ni.milo, q.df, res_column = "logFC")
+    qu.file <- paste0("~/Dropbox/GLMM/plots/RandolphcsQTLUMAP/RandolphGWAS-", k.snp, "_logFC-NhoodUMAP.png")
+    ggsave(plot=q.plot, filename=qu.file, height=4.5, width=6.5, dpi=300)
+    
+    # plot genotypes vs gene expression
+    ###--- genotype data ---### 
+    q.geno <- read.table(paste0("~/Dropbox/GLMM/subset_genotype.dir/", k.snp, ".traw"),
+                            header=TRUE, stringsAsFactors=FALSE, sep="\t")
+    colnames(q.geno) <- gsub(colnames(q.geno), pattern="(\\S+)_(\\S+)", replacement="\\1")
+    q.geno <- q.geno[q.geno$SNP %in% k.snp, !colnames(q.geno) %in% c("CHR", "X.C.M", "POS", "COUNTED", "ALT")]
+    q.nhoods <- na.omit(csqtl.eqtl.coloc.df$Nhood[csqtl.eqtl.coloc.df$Gene %in% q.gene & csqtl.eqtl.coloc.df$LeadSNP %in% k.snp]) 
+    
+    for(i in seq_along(q.nhoods)){
+      i.nh <- q.nhoods[i]
+      q.cellxsamp <- model.matrix(~0+SOC_indiv_ID, data=colData(rand.ni.milo))
+      colnames(q.cellxsamp) <- gsub(colnames(q.cellxsamp), pattern="SOC_indiv_ID", replacement="")
+      q.cellxsamp <- q.cellxsamp[, colnames(q.cellxsamp) %in% colnames(q.geno)]
+      
+      q.idx <- as.character(nhoodIndex(rand.ni.milo)[[i.nh]])
+      q.cellxnh <- nhoods(rand.ni.milo)[, q.idx, drop=FALSE]
+      q.cells <- rownames(q.cellxnh)[rowSums(q.cellxnh) > 0]
+      q.cellxsamp <- q.cellxsamp[q.cells, , drop=FALSE]
+      q.csums <- colSums(q.cellxsamp)
+      
+      q.ps <- counts(rand.ni.milo[rownames(rand.ni.milo) %in% q.gene, q.cells, drop=FALSE]) %*% q.cellxsamp
+      q.ps <- t(apply(q.ps, 1, FUN=function(GX) log((GX+1)/(q.csums+1))))
+      q.ps[is.na(q.ps)] <- 0
+      q.ps <- do.call(cbind.data.frame, list("Genes"=rownames(q.ps), q.ps))
+      rownames(q.ps) <- NULL
+      
+      q.snames <- intersect(colnames(q.ps), colnames(q.geno))
+      q.gene.vis <- as.data.frame(t(do.call(rbind.data.frame, list("Gene"=q.ps[,q.snames], "SNP"=q.geno[, q.snames]))))
+      q.gene.vis$SNP <- as.factor(q.gene.vis$SNP)
+      q.gene.vis <- na.omit(q.gene.vis)
+      
+      y.max <- max(q.gene.vis$Gene)
+      if(y.max == 0){
+        y.max.eps <- 0.1  
+      } else{
+        y.max.eps <- y.max * 0.1
+      }
+      
+      y.min <- min(q.gene.vis$Gene)
+      if(y.min == 0){
+        y.min.eps <- -0.1
+      } else{
+        y.min.eps <- y.min * 0.1  
+      }
+      
+      q.ident <- unique(csqtl.eqtl.coloc.df$ident[csqtl.eqtl.coloc.df$Nhood %in% i.nh])
+      q.col <- ct_cols[q.ident]
+      
+      q.box <- ggplot(q.gene.vis, aes(x=SNP, y=Gene)) +
+        geom_boxplot(notch=FALSE, fill=q.col, outlier.size=0.5) +
+        geom_jitter(width=0.1, shape=21, size=2, fill=darken(q.col)) +
+        theme_cowplot() +
+        labs(x=k.snp, y=paste("log ", q.gene, "\nexpression")) +
+        scale_y_continuous(limits=c(y.min-y.min.eps, y.max+y.max.eps)) +
+        theme(text=element_text(family="Roboto")) +
+        NULL
+    
+      qp.file <- paste0("~/Dropbox/GLMM/plots/RandolphQTLBoxplots/RandolphGWAS-", k.snp, "_", q.gene, "_", i.nh, "_boxplot.png")
+      ggsave(plot=q.box, file=qp.file, height=3, width=2.5, bg='white', dpi=300)
+    }
+  }
+}
+```
+
+
+Now we want equivalent plots for the csQTLs.
+
+```{r, fig.height=3, fig.width=2.5}
+csqtls <- unique(csqtl.eqtl.coloc.df$csQTL)
+
+for(x in seq_along(csqtls)) {
+  x.csqtl <- csqtls[x]
+  x.snp <- gsub(x.csqtl, pattern="(Nh)([0-9]+):([0-9]+_[0-9]+_[ATCG]+_[ATCG]+)", replacement="\\3")
+  x.nh <- as.numeric(gsub(x.csqtl, pattern="(Nh)([0-9]+):([0-9]+_[0-9]+_[ATCG]+_[ATCG]+)", replacement="\\2"))
+  x.ident <- unique(csqtl.eqtl.coloc.df$ident[csqtl.eqtl.coloc.df$Nhood %in% x.nh])
+  x.counts <- nhoodCounts(rand.ni.milo)[x.nh, ]
+  
+  x.geno <- read.table(paste0("~/Dropbox/GLMM/subset_genotype.dir/", x.snp, ".traw"),
+                       header=TRUE, stringsAsFactors=FALSE, sep="\t")
+  colnames(x.geno) <- gsub(colnames(x.geno), pattern="(\\S+)_(\\S+)", replacement="\\1")
+  x.geno <- x.geno[x.geno$SNP %in% x.snp, !colnames(x.geno) %in% c("CHR", "X.C.M", "POS", "COUNTED", "ALT"),]
+  x.samps <- intersect(names(x.counts), colnames(x.geno))
+  
+  x.df <- na.omit(data.frame("Samples"=x.samps, "Nhood"=x.counts[x.samps], "SNP"=as.vector(unlist(x.geno[1,x.samps]))))
+  x.df$SNP <- as.factor(x.df$SNP)
+  
+  x.pplot <- ggplot(x.df, aes(x=SNP, y=Nhood)) +
+    geom_boxplot(colour='grey50', outlier.alpha=0) +
+    geom_jitter(width=0.1) +
+    stat_summary(fun.y="median", geom="crossbar", colour='firebrick',
+                 mapping=aes(ymin=..y.., ymax=..y..), width=0.5) +
+    theme_cowplot() +
+    labs(x=x.snp, y=paste0("Nhood", x.nh, " (", x.ident, ")")) +
+    expand_limits(y=c(0)) +
+    theme(text=element_text(family="Roboto")) +
+    NULL
+  
+  x.pfile <- paste0("~/Dropbox/GLMM/plots/RandolphcsQTLNhoodBoxplots/RandolphGWAS-", x.snp, "_", x.nh, "_boxplot.png")
+  ggsave(plot=x.pplot, file=x.pfile, dpi=300, bg='white', height=3, width=2.5)
+}
+```
+
+
+
+
+
+
+
+# Integrate with eQTL Catalogue colocalisation
+
+How many csQTLs _in total_ are eQTLs either at cell type or cell state level?
+
+```{r}
+blueprint.monocyte.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000021.all.tsv.gz"
+blueprint.tcell.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000031.all.tsv.gz"
+dice.tfh_mem.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000439.all.tsv.gz"
+dice.th17.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000444.all.tsv.gz"
+dice.th1.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000449.all.tsv.gz"
+dice.th2.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000454.all.tsv.gz"
+dice.treg_mem.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000464.all.tsv.gz"
+dice.treg_naive.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000469.all.tsv.gz"
+dice.cd4_naive.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000479.all.tsv.gz"
+dice.cd8_naive.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000489.all.tsv.gz"
+dice.cd16_monocyte.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000499.all.tsv.gz"
+dice.monocyte.query <- "/Users/s08mm2/Dropbox/eQTLs/eQTLCatalogue/QTD000504.all.tsv.gz"
+
+eqtl.file.list <- list("BP.Mono"=blueprint.monocyte.query, "BP.Tcell"=blueprint.tcell.query, "DICE.TfhMem"=dice.tfh_mem.query, "DICE.Th17"=dice.th17.query,
+                       "DICE.Th1"=dice.th1.query, "DICE.Th2"=dice.th2.query, "DICE.TregMem"=dice.treg_mem.query, "DICE.TregNaive"=dice.treg_naive.query,
+                       "DICE.CD4Naive"=dice.cd4_naive.query, "DICE.CD8Naive"=dice.cd8_naive.query, "DICE.CD16Mono"=dice.cd16_monocyte.query,
+                       "DICE.Mono"=dice.monocyte.query)
+
+eqtl.sampsize.list <- list("BP.Mono"=200, "BP.Tcell"=200, "DICE.TfhMem"=91, "DICE.Th17"=91,
+                           "DICE.Th1"=91, "DICE.Th2"=91, "DICE.TregMem"=91, "DICE.TregNaive"=91,
+                           "DICE.CD4Naive"=91, "DICE.CD8Naive"=91, "DICE.CD16Mono"=91,
+                           "DICE.Mono"=91)
+```
+
+
+```{r}
+dataset.map <- cbind.data.frame(names(eqtl.file.list), unlist(eqtl.file.list))
+colnames(dataset.map) <- c("DataSet", "eQTLDataset")
+dataset.map$eQTLDataset <- gsub(dataset.map$eQTLDataset, pattern="([[:ascii:]]*/)(QTD[0-9]+)\\.(all\\.tsv\\.gz)", replacement="\\2", perl=TRUE)
+
+coloc.files <- list.files("~/Dropbox/GLMM/coloc.dir/", pattern="QTD", full.names=TRUE)
+eqtl.coloc.df <- do.call(rbind.data.frame, lapply(coloc.files, FUN=function(FX) read.table(FX, sep="\t", header=TRUE, stringsAsFactors=FALSE)))
+eqtl.coloc.df <- merge(eqtl.coloc.df, dataset.map, by='eQTLDataset', all.x=TRUE)
+eqtl.coloc.df$csQTL <- paste(paste0("Nh", eqtl.coloc.df$Nhood), eqtl.coloc.df$LeadSNP, sep=":")
+colnames(eqtl.coloc.df) <- gsub(colnames(eqtl.coloc.df), pattern="eGene", replacement="Gene")
+
+eqtl.coloc.df$eQTL.Type <- "eQTLCat"
+csqtl.eqtl.coloc.df$eQTL.Type <- "CellState"
+overlap.cols <- intersect(colnames(eqtl.coloc.df), colnames(csqtl.eqtl.coloc.df))
+compare.eqtl.coloc.df <- do.call(rbind.data.frame, list(eqtl.coloc.df[, overlap.cols], csqtl.eqtl.coloc.df[, overlap.cols]))
+```
+
+How many csQTLs have colocalised eQTLs in either or both types?
+
+```{r}
+eqtl.xtab <- as.matrix(table(compare.eqtl.coloc.df[compare.eqtl.coloc.df$PP.H4.abf >= 0.75, ]$csQTL, compare.eqtl.coloc.df[compare.eqtl.coloc.df$PP.H4.abf >= 0.75, ]$eQTL.Type))
+sum(apply(eqtl.xtab > 0, 1, FUN=function(LX) sum(LX)) == 0)
+sum(apply(eqtl.xtab > 0, 1, FUN=function(LX) sum(LX)) == 1)
+sum(apply(eqtl.xtab > 0, 1, FUN=function(LX) sum(LX)) >= 1)
+```
+
+There are 138 eQTLs with at least 1 colocalised eQTL and 32 that colocalise in both cell type and cell state analysis.
+
+```{r}
+sum(apply(eqtl.xtab > 0, 1, FUN=function(LX) sum(LX)) >= 1)/570
+```
+
+
+```{r, fig.height=3, fig.width=3}
+eqtl.cat.df <- data.frame("csQTL"=rownames(eqtl.xtab), 
+                          "is.CellState"=ifelse(apply(eqtl.xtab, 1, FUN=function(LX) LX[1] >=1), TRUE, FALSE),
+                          "is.CellType"=ifelse(apply(eqtl.xtab, 1, FUN=function(LX) LX[2] >=1), TRUE, FALSE),
+                          "is.eQTL"=ifelse(apply(eqtl.xtab > 0, 1, FUN=function(LX) sum(LX)) >= 1, TRUE, FALSE))
+
+eqtl.cat.df$eQTL.Cat <- "No.eQTL"
+eqtl.cat.df$eQTL.Cat[eqtl.cat.df$is.CellState & !eqtl.cat.df$is.CellType] <- "CellState"
+eqtl.cat.df$eQTL.Cat[!eqtl.cat.df$is.CellState & eqtl.cat.df$is.CellType] <- "CellType"
+eqtl.cat.df$eQTL.Cat[eqtl.cat.df$is.CellState & eqtl.cat.df$is.CellType] <- "Both"
+eqtl.cat.df$eQTL.Cat <- factor(eqtl.cat.df$eQTL.Cat,
+                               levels=c("CellType", "CellState", "Both"))
+
+ggplot(eqtl.cat.df, aes(x=eQTL.Cat)) +
+  geom_bar(colour='black') +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto", size=14)) +
+  labs(x="eQTL Category", y="#csQTLs") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_CellStateVsCellType_eQTL-bar.png",
+       height=3, width=3, dpi=300, bg='white')
+```
+
+

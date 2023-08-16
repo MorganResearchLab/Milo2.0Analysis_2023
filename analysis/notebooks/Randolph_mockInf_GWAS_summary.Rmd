@@ -1,0 +1,727 @@
+---
+title: "Randolph DA-GWAS results summary"
+output: html_notebook
+---
+
+I've run the DA-GWAS over the mock-infected PBMCs from Randolph _et al._ using the Milo2.0. Here I will collate and summarise the results from these analyses. 
+This will include overlaying the original cell type annotations on the DA nhoods to aid the interpretation.
+
+```{r}
+suppressMessages({
+library(SingleCellExperiment)
+library(miloR)
+library(Matrix)
+library(MatrixGenerics)
+library(ggplot2)
+library(ggsci)
+library(ggrepel)
+library(cowplot)
+library(scales)
+library(scattermore)
+library(BiocParallel)
+library(wordcloud)
+library(wordcloud2)
+library(tm)
+library(tidyr)
+library(dplyr)
+library(viridis)
+library(reshape2)
+library(biomaRt)
+library(colorspace)
+library(gridExtra)
+library(grid)
+library(UpSetR)
+library(enrichR)
+library(gwasrapidd)
+})
+```
+
+# Mock-infected PBMCs
+
+```{r}
+rand.ni.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_Milo.RDS")
+rand.ni.meta <- as.data.frame(colData(rand.ni.milo))
+rand.ni.meta$CellID <- colnames(rand.ni.milo)
+rand.ni.fr <- as.data.frame(reducedDim(rand.ni.milo, "UMAP"))
+rand.ni.fr$CellID <- colnames(rand.ni.milo)
+
+rand.ni.meta <- merge(rand.ni.meta, rand.ni.fr, by="CellID")
+```
+
+```{r}
+# use this for annotating the csQTL results
+glmm.da.res <- read.table("~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+                      sep="\t", header=TRUE, stringsAsFactors = FALSE)
+```
+
+
+```{r}
+# gwas results files - do these only contain the nhoods for which the SNP is DA?
+gwas.dir <- "~/Dropbox/GLMM/locus.dir/"
+gwas.files <- list.files(gwas.dir, pattern="\\.gz$", full.names=TRUE, recursive=TRUE, include.dirs=TRUE)
+gwas.list <- list()
+for(x in seq_along(gwas.files)){
+  x.file <- gwas.files[x]
+  x.lead <- gsub(x.file, pattern="([[:ascii:]]*)/(chr[0-9]+)/([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)(_locus\\.tsv\\.gz)", 
+                 replacement="\\3_\\4_\\5_\\6", perl=TRUE)
+  x.chr <- gsub(x.lead, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1")
+  x.bp <- as.numeric(gsub(x.lead, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+  
+  # tabix this for speed
+  x.tab.query <- paste0("tabix ", x.file, " ", paste0(x.chr, ":", x.bp-10, "-", x.bp+10))
+  x.df <- do.call(rbind.data.frame, lapply(system(x.tab.query, intern=TRUE), FUN=function(TX){
+    unlist(strsplit(TX, split="\t", fixed=TRUE))
+  }))
+  
+  colnames(x.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+  x.df$CHR <- as.numeric(x.df$CHR)
+  x.df$BP <- as.numeric(x.df$BP)
+  x.df$logFC <- as.numeric(x.df$logFC)
+  x.df$SE <- as.numeric(x.df$SE)
+  x.df$GeneticVariance <- as.numeric(x.df$GeneticVariance)
+  x.df$SpatialFDR <- as.numeric(x.df$SpatialFDR)
+  x.df$Nhood <- as.numeric(x.df$Nhood)
+  
+  x.lead <- gsub(x.file, pattern="([[:ascii:]]*)/(chr[0-9]+)/([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)(_locus\\.tsv\\.gz)", 
+                 replacement="\\3_\\4_\\5_\\6", perl=TRUE)
+  # only keep the FDR <= 1e-8, there are too many SNPs otherwise
+  x.df <- x.df[x.df$SpatialFDR <= 1e-8, ]
+  
+  x.df <- merge(x.df, glmm.da.res[, c("Nhood", "ident", "ident_fraction", "NhoodGroup")])
+  x.df$LeadSNP <- x.lead
+  gwas.list[[x.file]] <- x.df
+}
+
+gwas.hits.df <- do.call(rbind.data.frame, gwas.list)
+table(gwas.hits.df$ident) 
+```
+
+How are the GWAS hits distributed over the genome?
+
+```{r}
+ggplot(distinct(gwas.hits.df, LeadSNP, .keep_all=TRUE), aes(x=CHR)) +
+  geom_bar(position="dodge") +
+  theme_cowplot() +
+  NULL
+```
+
+The lead SNPs are distributed pretty evenly across the whole genome. What about the distribution of effect sizes, are they all positive or negative, or balanced?
+
+```{r}
+ggplot(gwas.hits.df[gwas.hits.df$LeadSNP == gwas.hits.df$SNP, ], aes(x=logFC)) +
+  geom_density() +
+  theme_cowplot() +
+  NULL
+```
+
+This histogram only considers the lead SNPs - there is a strong bias towards SNPs with an increase in abundance - is this a bias in detection, i.e. there is more dynamic 
+range > 0 than < 0? That shouldn't be a problem as this is on a log scale so the +/- real numbers are infinite in both directions.
+
+```{r}
+ggplot(gwas.hits.df, aes(x=logFC)) +
+  geom_density() +
+  theme_cowplot() +
+  NULL
+```
+
+That looks vaguely sensible - a peak at 0 (as this includes the non-associated SNPs as well), but this is only if we consider __all__ SNPs, including the non-associated ones. 
+Perhaps the other issues are (a) small sample size leading to biased inference, (b) uneven represenation of rare and abundant cell states.
+
+How then do the results vary over the original cell type annotations?
+
+```{r}
+ggplot(gwas.hits.df, aes(x=CHR)) +
+  geom_bar(position="dodge") +
+  theme_cowplot() +
+  facet_wrap(~ident, scales="free_y") +
+  NULL
+```
+
+The variation across cell states almost certainly reflects differences in the abundance of the different cell types as well as the genetic architecture of the 
+different cell state abundances. 
+
+How many QTLs are there for each nhood?
+
+```{r, fig.height=3, fig.width=4}
+nh.qtl.df <- gwas.hits.df[gwas.hits.df$SNP == gwas.hits.df$LeadSNP, ] %>% distinct(Nhood, LeadSNP, .keep_all=TRUE) %>% group_by(Nhood) %>%
+  summarise("N.QTLs"=length(unique(LeadSNP)))
+
+ggplot(nh.qtl.df, aes(x=N.QTLs)) +
+  geom_histogram(binwidth=5, colour='black') +
+  theme_cowplot() +
+  theme(legend.title=element_text(face="bold"), axis.title=element_text(face="bold"),
+          axis.text=element_text(face="bold")) +
+  labs(x="#QTLs per Nhood", y="#Nhoods") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_NQTLs_per_nhood-histogram.png",
+      height=3, width=4, dpi=300, bg='white')
+```
+
+
+## csQTLs vs. popDA 
+
+```{r}
+glmm.da.res <- read.table("~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+                      sep="\t", header=TRUE, stringsAsFactors = FALSE)
+```
+
+Plot the number of lead SNPs per cell type.
+
+```{r, fig.height=4, fig.width=5.5}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+# only merge the DA nhoods
+gwas.annot.df <- distinct(merge(gwas.hits.df[gwas.hits.df$SpatialFDR < 1e-8 & gwas.hits.df$SNP == gwas.hits.df$LeadSNP,],
+                                glmm.da.res[, c("Nhood", "NhoodGroup")], by='Nhood', all.x=TRUE),
+                          LeadSNP, ident, .keep_all=TRUE)
+                          
+ggplot(distinct(gwas.annot.df, SNP, ident, .keep_all=TRUE), aes(x=ident, fill=ident)) +
+    geom_bar(colour='black') +
+    geom_text(stat='count', aes(label=after_stat(count)),
+              nudge_y=15, family="Roboto") +
+    scale_fill_manual(values=ct_cols) +
+    theme_cowplot() +
+    theme(legend.title=element_text(face="bold"), axis.title=element_text(face="bold"),
+          axis.text=element_text(face="bold")) +
+    guides(fill=guide_legend(title="Cell type")) +
+    labs(x="Cell type", y="#csQTLs") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_NcsQTLs_byCelltype-bar.png",
+       height=4, width=5.5, dpi=300, bg='white')
+```
+
+Break this down by chromosome
+
+```{r, fig.height=4, fig.width=7.5}
+chr_cols <- colorRampPalette(c(lighten(ct_cols[1], 1), darken(ct_cols[1], 1)))(22)
+names(chr_cols) <- c(1:22)
+
+# only merge the DA nhoods
+gwas.annot.df <- distinct(merge(gwas.hits.df[gwas.hits.df$SpatialFDR < 1e-8 & gwas.hits.df$SNP == gwas.hits.df$LeadSNP,],
+                                glmm.da.res[, c("Nhood", "NhoodGroup")], by=c('Nhood', "NhoodGroup"), all.x=TRUE),
+                          LeadSNP, ident, .keep_all=TRUE)
+gwas.annot.df$CHR <- ordered(gwas.annot.df$CHR,
+                             levels=c(1:22))
+                          
+ggplot(distinct(gwas.annot.df, SNP, ident, .keep_all=TRUE), aes(x=CHR)) +
+    geom_bar(colour='black') +
+    # scale_fill_manual(values=chr_cols) +
+    theme_cowplot() +
+    theme(legend.title=element_text(face="bold"), axis.title=element_text(face="bold"),
+          axis.text=element_text(face="bold"), strip.text=element_text(face="bold"),
+          axis.text.x=element_text(face="bold", size=10),
+          strip.background = element_rect(fill='white', colour='white')) +
+    labs(x="Chromosome", y="#csQTLs") +
+    facet_wrap(~ident, scales="free_y") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_NcsQTLs_byChromosome-bar.png",
+       height=4, width=7.5, dpi=300, bg='white')
+```
+
+What proportion of csQTL nhoods are found in each cell type?
+
+```{r, warning=FALSE}
+celltypes <- unique(gwas.hits.df$ident)
+
+ct.prop.list <- list()
+ct.count.list <- list()
+for(x in seq_along(celltypes)){
+    x.ct <- celltypes[x]
+    x.nhoods <- gwas.hits.df[gwas.hits.df$ident %in% x.ct & gwas.hits.df$SpatialFDR < 1e-8 & gwas.hits.df$SNP == gwas.hits.df$LeadSNP, ]
+    x.nhoods <- distinct(.data=x.nhoods, LeadSNP, Nhood, ident, .keep_all=TRUE)
+    x.ct.nhoods <- glmm.da.res[glmm.da.res$ident %in% x.ct, ]$Nhood
+    x.da.csqtl <- length(intersect(glmm.da.res[glmm.da.res$ident %in% x.ct & glmm.da.res$SpatialFDR < 0.1, ]$Nhood, x.nhoods$Nhood))
+    x.da.notcsqtl <- length(setdiff(glmm.da.res[glmm.da.res$ident %in% x.ct & glmm.da.res$SpatialFDR < 0.1, ]$Nhood, x.nhoods$Nhood))
+    x.csqtl.notda <- length(setdiff(x.nhoods$Nhood, glmm.da.res[glmm.da.res$ident %in% x.ct & glmm.da.res$SpatialFDR < 0.1, ]$Nhood))
+    x.notda.nocsqtl <- length(setdiff(glmm.da.res[glmm.da.res$ident %in% x.ct & glmm.da.res$SpatialFDR >= 0.1, ]$Nhood, x.nhoods$Nhood))
+    
+    # compute proportions
+    x.df <- data.frame("Celltype"=x.ct, "DA & QTL"=x.da.csqtl/length(x.ct.nhoods),
+                       "DA Only"=x.da.notcsqtl/length(x.ct.nhoods), "QTL Only"=x.csqtl.notda/length(x.ct.nhoods),
+                       "Neither"=x.notda.nocsqtl/length(x.ct.nhoods))
+    ct.prop.list[[x.ct]] <- x.df
+    
+    ct.count.list[[x.ct]] <- data.frame("Celltype"=x.ct, "DA & QTL"=x.da.csqtl,
+                                        "DA Only"=x.da.notcsqtl, "QTL Only"=x.csqtl.notda,
+                                        "Neither"=x.notda.nocsqtl)
+}
+
+ct.prop.df <- do.call(rbind.data.frame, ct.prop.list)
+ct.prop.melt <- melt(ct.prop.df, id.vars="Celltype")
+colnames(ct.prop.melt) <- c("Celltype", "Category", "Prop")
+
+ct.count.df <- do.call(rbind.data.frame, ct.count.list)
+ct.count.melt <- melt(ct.count.df, id.vars="Celltype")
+colnames(ct.count.melt) <- c("Celltype", "Category", "Count")
+
+ct.plot.df <- merge(ct.prop.melt, ct.count.melt, by=c("Celltype", "Category"))
+```
+
+
+
+```{r, fig.height=4, fig.width=5.5}
+class_cols <- colorRampPalette(c(lighten(ct_cols[9], 0.5), darken(ct_cols[9], 0.4)))(4)
+names(class_cols) <- levels(ct.plot.df$Category)
+
+ggplot(ct.plot.df[!ct.plot.df$Category %in% c("Neither"), ], 
+       aes(x=Celltype, y=Prop, fill=Category)) +
+    geom_bar(colour='black', stat='identity', position="stack") +
+    geom_text(data=ct.plot.df[!ct.plot.df$Category %in% c("Neither") & ct.plot.df$Count > 0, ],
+              aes(label=Count, group=Category),
+              position=position_stack(vjust=0.5),
+              family="Roboto") +
+    theme_cowplot() +
+    scale_fill_manual(values=class_cols, labels=c("popDA & csQTL", "popDA Only", "csQTL Only")) +
+    labs(x="Celltype", y="Prop. nhoods") +
+    theme(legend.title=element_text(face="bold"), axis.title=element_text(face="bold"),
+          axis.text=element_text(face="bold")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_DAvsQTL_nhoodProps-bar.png",
+       height=4, width=5.5, bg='white', dpi=300)
+```
+
+For each lead SNP, how many (a) nhoods is it a csQTL for, and (b) how many cell types?
+
+```{r}
+lead.snps <- unique(gwas.hits.df$LeadSNP)
+snp.count.list <- list()
+
+for(i in seq_along(lead.snps)){
+    i.snp <- lead.snps[i]
+    i.nhoods <- unique(gwas.hits.df[gwas.hits.df$LeadSNP %in% i.snp &
+                                        gwas.hits.df$SNP == gwas.hits.df$LeadSNP &
+                                        gwas.hits.df$SpatialFDR < 1e-8, ]$Nhood)
+    # count majority cell type
+    i.ct <- unique(gwas.hits.df[gwas.hits.df$Nhood %in% i.nhoods &
+                                    gwas.hits.df$LeadSNP %in% i.snp &
+                                    gwas.hits.df$SNP == gwas.hits.df$LeadSNP &
+                                    gwas.hits.df$SpatialFDR < 1e-8, ]$ident)
+    i.nct <- length(i.ct)
+    # if(length(i.ct) > 1){
+    #     i.tab <- table(gwas.hits.df[gwas.hits.df$LeadSNP %in% i.snp, ]$ident)
+    #     i.ct <- names(i.tab)[which(i.tab == max(i.tab))]
+    # }
+    
+    # how many of these are also popDA?
+    i.ct.nhoods <- intersect(i.nhoods, unique(glmm.da.res[glmm.da.res$SpatialFDR < 0.1,]$Nhood)) # number that are popDA
+    if(length(i.ct.nhoods) > 0){
+        i.popda <- length(i.ct.nhoods)/length(i.nhoods)
+    } else{
+        i.popda <- 0
+    }
+    
+    snp.count.list[[i.snp]] <- data.frame("LeadSNP"=i.snp, "N.Nhoods"=length(i.nhoods), "N.Celltypes"=i.nct,
+                                          "Celltype"=paste(i.ct, collapse=","), "Prop.popDA"=i.popda)
+}
+
+snp.count.df <- do.call(rbind.data.frame, snp.count.list)
+```
+
+
+```{r, fig.height=3, fig.width=6.5}
+max.nhoods <- max(snp.count.df$N.Nhoods)
+
+ggplot(snp.count.df, aes(x=N.Nhoods)) +
+    geom_histogram(binwidth=1, colour='black') +
+    theme_cowplot() +
+    scale_x_continuous(breaks=c(0, c(1:max.nhoods))) +
+    labs(x="#Nhoods", y="#Lead SNPs") +
+    # NULL
+
+ggplot(snp.count.df, aes(x=N.Celltypes)) +
+    geom_histogram(binwidth=1, colour='black') +
+    theme_cowplot() +
+    scale_x_continuous(breaks=c(0, c(1:max.nhoods))) +
+    labs(x="#Cell types", y="#Lead SNPs") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_csQTL_counting.png",
+       height=3, width=6.5, dpi=300, bg='white')
+```
+
+These might be clearer as UpSet plots. I want to know if the lead SNPs that affect multiple cell types are more likely to be in popDA nhoods.
+
+```{r, fig.height=4, fig.width=6}
+# needs a list with a slot for each category:
+# is.popDA
+# is csQTL
+upset.cs.popda.list <- list("popDA"=glmm.da.res[glmm.da.res$SpatialFDR < 0.1, ]$Nhood,
+                            "csQTL"=gwas.hits.df[gwas.hits.df$SpatialFDR < 1e-8, ]$Nhood)
+
+upset.leadsnp.list <- list("CD4 Tcells"=gwas.hits.df[gwas.hits.df$SpatialFDR < 1e-8 &
+                                                          gwas.hits.df$SNP == gwas.hits.df$LeadSNP &
+                                                          gwas.hits.df$ident %in% c("CD4_T"), ]$LeadSNP,
+                           "CD8 Tcells"=gwas.hits.df[gwas.hits.df$SpatialFDR < 1e-8 &
+                                                          gwas.hits.df$SNP == gwas.hits.df$LeadSNP &
+                                                          gwas.hits.df$ident %in% c("CD8_T"), ]$LeadSNP,
+                           "Monocytes"=gwas.hits.df[gwas.hits.df$SpatialFDR < 1e-8 &
+                                                        gwas.hits.df$SNP == gwas.hits.df$LeadSNP &
+                                                        gwas.hits.df$ident %in% c("monocytes"), ]$LeadSNP)
+
+png("~/Dropbox/GLMM/plots/Randolph_csQTL-popDA_Nhoods-upset.png", res=300, height=4, width=6, units="in")
+upset(fromList(upset.cs.popda.list), point.size=3, line.size=2, mainbar.y.label="Nhood intersection",
+      sets.x.label="Nhood class", order.by="freq", sets.bar.color=ct_cols[9])
+dev.off()
+
+upset(fromList(upset.cs.popda.list), point.size=3, line.size=2, mainbar.y.label="Nhood intersection",
+      sets.x.label="Nhood class", order.by="freq", sets.bar.color=ct_cols[9])
+```
+
+```{r}
+png("~/Dropbox/GLMM/plots/Randolph_csQTL-Celltype_LeadSNPs-upset.png", res=300, height=4, width=6, units="in")
+upset(fromList(upset.leadsnp.list), point.size=3, line.size=2, mainbar.y.label="Lead SNP intersection",
+      sets.x.label="csQTL Cell type", order.by="freq", sets.bar.color=ct_cols[9],
+      mb.ratio=c(0.5, 0.5),  text.scale=c(1.5, 2, 1.5, 1.2, 2, 2))
+dev.off()
+
+upset(fromList(upset.leadsnp.list), point.size=3, line.size=2, mainbar.y.label="Lead SNP intersection",
+      sets.x.label="csQTL Cell type", order.by="freq", sets.bar.color=ct_cols[9],
+      mb.ratio=c(0.5, 0.5), text.scale=c(1.5, 1.5, 1.5, 1.2, 2, 2))
+```
+
+For each lead SNP I will want to make a NhoodGraph plot of the results, which means I need to extract the full results for each. 
+
+## Annotating results
+
+```{r, warning=FALSE, message=FALSE}
+biomaRt.connection <- useMart("ensembl", "hsapiens_gene_ensembl", host="grch37.ensembl.org",)
+
+gene.df <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "chromosome_name", 
+                                "strand", "start_position", "end_position", "gene_biotype"),
+                 mart=biomaRt.connection)
+rownames(gene.df) <- gene.df$ensembl_gene_id
+gene.df <- gene.df[!grepl(gene.df$gene_biotype, pattern="pseudogene"), ]
+gene.df <- gene.df[!gene.df$gene_biotype %in% c("artifact", "vault_RNA", "snoRNA", "snRNA", "sRNA", "scRNA", "scaRNA"),]
+```
+
+We often want to know which genes might be explaining the signal, and therefore use this information to construct a nice biological story from our results. Current evidence suggests 
+that the nearest gene to a lead SNP is the best candidate causal gene in ~60% of cases. I will annotate each lead SNP by the nearest genes; where there are multiple choices within 
+a 1kb interval I will annotate with all of them. Moreover, we can go and look at the expression levels of those genes in the affected neighbourhoods to address our question of 
+whether the genetic effect is driving the emergence of a cell state _in situ_ or is more likely to have an upstream effect in a progenitor cell state.
+
+```{r}
+annot.list <- list()
+interval.size <- 500000L
+
+for(i in seq_along(lead.snps)){
+  i.snp <- lead.snps[i]
+  i.bp <- unique(gwas.hits.df[gwas.hits.df$SNP %in% i.snp, ]$BP)
+  i.chr <- unique(gwas.hits.df[gwas.hits.df$SNP %in% i.snp, ]$CHR)
+  
+  # start with a 500kb interval around the SNP - extend out iff there are no genes found
+  i.start <- i.bp - interval.size
+  if(i.start < 1){
+    i.start < 1
+  }
+  
+  i.end <- i.bp + interval.size
+  
+  # get the genes in this interval (if any)
+  i.genes.plus <- gene.df[gene.df$chromosome_name %in% i.chr &
+                            (gene.df$start_position >= i.start & gene.df$end_position <= i.end) &
+                            gene.df$strand > 0, ]
+  i.genes.minus <- gene.df[gene.df$chromosome_name %in% i.chr &
+                             (gene.df$start_position <= i.start & gene.df$end_position >= i.end) &
+                             gene.df$strand < 0, ]
+  i.genes.in <- gene.df[gene.df$chromosome_name %in% i.chr &
+                          (i.start <= gene.df$start_position) & (i.end >= gene.df$end_position), ]
+  
+  i.genes <- do.call(rbind.data.frame, list(i.genes.plus, i.genes.minus, i.genes.in))
+  
+  while(nrow(i.genes) == 0){
+    i.start <- i.start - interval.size
+    i.end <- i.end + interval.size
+    if(i.start < 1){
+      i.start <- 1
+    }
+    i.genes <- gene.df[gene.df$chromosome_name %in% i.chr &
+                       (gene.df$start_position >= i.start & gene.df$end_position <= i.end), ]
+  }
+  
+  i.genes$StartDist <- abs(i.bp - i.genes$start_position)
+  i.genes$EndDist <- abs(i.bp - i.genes$end_position)
+  i.start.min <- min(i.genes$StartDist)
+  i.end.min <- min(i.genes$EndDist)
+  i.min <- min(c(i.start.min, i.end.min))
+  
+  # any genes within +/- 1Kb of this distance
+  if(any(i.genes$StartDist[i.genes$StartDist != i.min & i.genes$EndDist != i.min] <= (i.start.min - 1000))){
+    i.nearest <- i.genes[i.genes$StartDist == i.min | i.genes$EndDist == i.min, ]$external_gene_name
+    i.ensembl <- i.genes[i.genes$StartDist == i.min | i.genes$EndDist == i.min, ]$ensembl_gene_id
+    
+  } else if(any(i.genes$EndDist[i.genes$StartDist != i.min & i.genes$EndDist != i.min] <= (i.end.min + 1000))){
+    i.nearest <- i.genes[i.genes$StartDist == i.min | i.genes$EndDist == i.min, ]$external_gene_name
+    i.ensembl <- i.genes[i.genes$StartDist == i.min | i.genes$EndDist == i.min, ]$ensembl_gene_id
+  } else{
+    i.nearest <- i.genes[i.genes$StartDist == i.min | i.genes$EndDist == i.min, ]$external_gene_name
+    i.ensembl <- i.genes[i.genes$StartDist == i.min | i.genes$EndDist == i.min, ]$ensembl_gene_id
+  }
+  
+  
+  # if the gene is _inside_ the gene body then set the distance to 0
+  if(length(i.ensembl) == 1){
+    if(i.bp %in% seq(i.genes[i.genes$ensembl_gene_id %in% i.ensembl, ]$start_position, i.genes[i.genes$ensembl_gene_id %in% i.ensembl, ]$end_position)){
+      i.min <- 0
+    }
+  } else if(length(i.ensembl) > 1){
+    if(any(sapply(i.ensembl, FUN=function(GX){
+      i.bp %in% seq(unique(i.genes[i.genes$ensembl_gene_id %in% GX, ]$start_position), unique(i.genes[i.genes$ensembl_gene_id %in% GX, ]$end_position))
+      }))){
+        i.min <- 0
+      }
+  }
+  
+  annot.list[[i.snp]] <- data.frame("SNP"=i.snp, "Nearest.Gene"=paste(unique(i.nearest), collapse=","), 
+                                    "CHR"=i.chr, "BP"=i.bp,
+                                    "Nearest.Ensembl"=paste(unique(i.ensembl), collapse=","), "Distance"=i.min)
+}
+
+snp.annot.df <- do.call(rbind.data.frame, annot.list)
+
+# write as a csv file to use as supplementary table
+snp.annot.merge <- merge(snp.annot.df, gwas.hits.df, by=c("SNP", "CHR", "BP"), all.y=TRUE)
+snp.annot.merge$csQTL <- paste0(paste0("Nh", snp.annot.merge$Nhood), ":", snp.annot.merge$LeadSNP)
+
+write.table(snp.annot.merge[order(snp.annot.merge$CHR, snp.annot.merge$BP),
+                            c("csQTL", "LeadSNP", "CHR", "BP", "REF", "ALT", "Nhood", "ident", "logFC", "SE", "SpatialFDR", "Nearest.Gene", "Distance")],
+            file="~/Dropbox/GLMM/results/SuppTable-csQTL_summary.csv",
+            sep="\t", quote=FALSE, row.names=FALSE)
+```
+
+
+
+
+
+
+Loop over each of these annotated genes, and where it is detected, plot the expression across the UMAP.
+
+```{r}
+# add the expression of these genes to the colData
+all.genes <- unlist(strsplit(snp.annot.df$Nearest.Gene, split=",", fixed=TRUE))
+gene.goi <- as.data.frame(as.matrix(t(logcounts(rand.ni.milo[rownames(rand.ni.milo) %in% all.genes, ]))))
+rownames(gene.goi) <- colnames(rand.ni.milo)
+
+for(k in seq_along(colnames(gene.goi))){
+  k.gene <- colnames(gene.goi)[k]
+  colData(rand.ni.milo)[, k.gene] <- gene.goi[, k.gene]
+}
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+exprs.gene.list <- list()
+
+for(j in seq_along(lead.snps)){
+    j.gene <- unlist(strsplit(snp.annot.df$Nearest.Gene[snp.annot.df$SNP %in% lead.snps[j]], split=",", fixed=TRUE))
+    j.snp <- lead.snps[j]
+    j.nhoods <- unique(gwas.hits.df[gwas.hits.df$LeadSNP %in% j.snp & gwas.hits.df$SpatialFDR < 1e-8, ]$Nhood)
+    for(q in seq_along(j.gene)){
+        q.gene <- j.gene[q]
+        
+        if(q.gene %in% colnames(colData(rand.ni.milo))){
+            p.plot <- plotNhoodGraph(rand.ni.milo, layout="UMAP", colour_by=q.gene) +
+                scale_fill_viridis(option="plasma") +
+                guides(fill=guide_colorbar(title=q.gene)) +
+                NULL
+            
+            p.file <- paste0("~/Dropbox/GLMM/plots/RandolphUMAPs/Randolph_GWAS-", lead.snps[j], "-", q.gene, "_NhoodUMAP.png")
+            ggsave(plot=p.plot, filename=p.file, height=4.5, width=6.5, dpi=300)
+    
+            # are the genes nearby expressed in any of the DA nhoods?
+            j.expressed <- sum(nhoodExpression(rand.ni.milo)[q.gene, j.nhoods, drop=FALSE] > 0)
+            exprs.gene.list[[paste0(j.snp, q.gene)]] <- data.frame("SNP"=j.snp, "Gene"=q.gene, "N.Exprs"=j.expressed, "N.Nhoods"=length(j.nhoods))
+        } else{
+            j.nhoods <- unique(gwas.hits.df[gwas.hits.df$LeadSNP %in% j.snp & gwas.hits.df$SpatialFDR < 1e-8, ]$Nhood)
+            exprs.gene.list[[paste0(j.snp, q.gene)]] <- data.frame("SNP"=j.snp, "Gene"=q.gene, "N.Exprs"=0, "N.Nhoods"=length(j.nhoods))
+        }
+    }
+}
+
+exprs.gene.df <- do.call(rbind.data.frame, exprs.gene.list)
+exprs.gene.df <- merge(exprs.gene.df, snp.count.df, by.x=c("SNP", "N.Nhoods"), by.y=c("LeadSNP", "N.Nhoods"))
+exprs.gene.df$Pleiotropic <- ifelse(exprs.gene.df$N.Celltypes == 1, "Unitropic", "Pleiotropic")
+exprs.gene.df$Pleiotropic <- factor(exprs.gene.df$Pleiotropic,
+                                    levels=c("Unitropic", "Pleiotropic"))
+sum(exprs.gene.df$N.Exprs > 0)
+sum(exprs.gene.df$N.Exprs > 0)/length(unique(exprs.gene.df$Gene))
+```
+
+What proportion of nearby genes to lead SNPs are expressed in the same csQTL nhoods?
+
+
+I'll also generate the single-cell UMAP plots which might be a bit clearer
+
+```{r}
+# gene.goi$CellID <- colnames(rand.ni.milo)
+# rand.goi.merge <- merge(rand.ni.meta, gene.goi, by='CellID')
+# 
+# plot.list <- list()
+# for(j in seq_along(lead.snps)){
+#     j.gene <- unlist(strsplit(snp.annot.df$Nearest.Gene[snp.annot.df$SNP %in% lead.snps[j]], split=",", fixed=TRUE))
+#     for(q in seq_along(j.gene)){
+#         q.gene <- j.gene[q]
+#         
+#     if(j.gene %in% colnames(colData(rand.ni.milo))){
+#         p.df <- rand.goi.merge[, c("UMAP1", "UMAP2", q.gene)]
+#         colnames(p.df) <- c("UMAP1", "UMAP2", "Gene")
+#     
+#         p.sc.plot <- ggplot(p.df, aes(x=UMAP1, y=UMAP2)) +
+#             geom_scattermore(aes(colour=Gene), pointsize=0.75) +
+#             scale_colour_viridis(option="plasma") +
+#             guides(colour=guide_colorbar(title=q.gene)) +
+#             theme_cowplot() +
+#             NULL
+#       
+#         p.sc.file <- paste0("~/Dropbox/GLMM/plots/RandolphUMAPs/Randolph_GWAS-", lead.snps[j], "-", q.gene, "_scUMAP.png")
+#         ggsave(plot=p.sc.plot, filename=p.sc.file, height=4.5, width=6.5, dpi=300, bg='white')
+#     }
+#   }
+# }
+
+```
+
+
+```{r, fig.width=4, fig.height=3}
+ggplot(exprs.gene.df, aes(x=as.character(as.numeric(N.Exprs > 0)))) +
+    geom_bar(colour='black') +
+    theme_cowplot() +
+    labs(x="Gene Expressed in\nDA Nhood", y="Count") +
+    expand_limits(x=c(0, 1)) +
+    facet_wrap(~Pleiotropic) +
+    theme(strip.text=element_text(face="bold", size=14), 
+          strip.background=element_rect(fill='white'),
+          axis.title=element_text(face="bold"), 
+          axis.text=element_text(face="bold")) +
+    NULL
+
+ggsave2("~/Dropbox/GLMM/plots/Randolph_DAExpressedGene-Binary.png",
+        height=3, width=4, dpi=300, bg='white')
+```
+
+Given the somewhat extensive pleiotropy - I've split this out by uni-tropic and pleitropic SNPs. There doesn't seem to be a huge difference between them though.
+
+
+```{r, fig.width=6, fig.height=2.5}
+p.bin <- ggplot(exprs.gene.df, aes(x=as.character(as.numeric(N.Exprs > 0)))) +
+    geom_bar(colour='black') +
+    theme_cowplot() +
+    labs(x="Gene Expressed in\nDA Nhood", y="Count") +
+    expand_limits(x=c(0, 1)) +
+    facet_wrap(~Pleiotropic) +
+    theme(strip.text=element_text(face="bold", size=14), 
+          strip.background=element_rect(fill='white'),
+          axis.title=element_text(face="bold"), 
+          axis.text=element_text(face="bold")) +
+    NULL
+    
+
+p.hist <- ggplot(exprs.gene.df[exprs.gene.df$N.Exprs > 0, ], aes(x=N.Exprs/N.Nhoods)) +
+    geom_histogram(binwidth=0.2, colour='black') +
+    theme_cowplot() +
+    labs(x="Prop. Nhoods Expressed", y="Count") +
+    expand_limits(x=c(0, 1)) +
+    scale_x_continuous(breaks=seq(0, 1, by=0.2)) +
+    theme(axis.title=element_text(face="bold"), 
+          axis.text=element_text(face="bold")) +
+    NULL
+
+plot_grid(p.bin, p.hist, rel_widths=c(0.9, 1))
+
+ggsave2("~/Dropbox/GLMM/plots/Randolph_DAExpressedGene-Histo.png",
+        height=2.5, width=7.5, dpi=300, bg='white')
+```
+
+Need to do a GO/functional enrichment on the nearby gene set.
+
+
+```{r}
+test.dbs <- c("MSigDB_Hallmark_2020")
+
+csqtl.enrich <- enrichr(exprs.gene.df$Gene, databases=test.dbs)[[test.dbs]]
+```
+
+## eQTL overlap
+
+What is the overlap with the eQTLs from Randolph _et al_?
+
+```{r}
+rand.eqtls <- read.table("~/Dropbox/GLMM/data/Randolph_eQTLs.txt",
+                         sep="\t", header=TRUE)
+qtl.ct.names <- colnames(rand.eqtls[, -1])
+
+rand.eqtls$Gene <- gsub(rand.eqtls$gene_SNP, pattern="([[:alnum:]|\\.]*)_([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)",
+                        replacement="\\1")
+rand.eqtls$SNP <- gsub(rand.eqtls$gene_SNP, pattern="([[:alnum:]\\.]*)_([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)",
+                        replacement="\\2_\\3_\\4_\\5")
+
+length(intersect(rand.eqtls$SNP, gwas.hits.df$LeadSNP))
+```
+
+There is no overlap between the groups of lead SNPs. What about _any_ SNPs?
+
+```{r}
+# firstly is there _any_ overlap between lead SNPs?
+any.snp.intersect <- intersect(rand.eqtls$SNP, gwas.hits.df$LeadSNP)
+length(any.snp.intersect)
+```
+
+Are _any_ of these genome-wide significant? I'll plot these at different thresholds.
+
+```{r, fig.height=3, fig.width=4}
+p.thresh <- c(1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8)
+
+thresh.snp.list <- list()
+eqtl.overlap.list <- list()
+
+for(q in seq_along(p.thresh)){
+    q.thresh <- p.thresh[q]
+    q.snps <- unique(gwas.hits.df[gwas.hits.df$SNP %in% any.snp.intersect & gwas.hits.df$SpatialFDR < q.thresh, ]$SNP)
+    
+    # which genes and cell types are eQTLs at lfsr < 0.1?
+    q.which <- t(apply(rand.eqtls[rand.eqtls$SNP %in% q.snps, qtl.ct.names],
+                       1, FUN=function(GX) any(GX < 0.1)))
+    q.egenes <- rand.eqtls[rand.eqtls$SNP %in% q.snps, ]$Gene[q.which]
+    q.esnps <- rand.eqtls[rand.eqtls$SNP %in% q.snps, ]$SNP[q.which]
+    q.ct <- sapply(q.egenes, FUN=function(EGENE, qtls){
+        colnames(qtls)[which(qtls[qtls$Gene %in% EGENE, ] < 0.1)]
+    }, qtls=rand.eqtls[rand.eqtls$SNP %in% q.snps, ])
+    
+    q.nhood.ct <- unique(gwas.hits.df[gwas.hits.df$SNP %in% any.snp.intersect & gwas.hits.df$SpatialFDR < q.thresh, ]$ident)
+    q.leadsnp <- unique(gwas.hits.df[gwas.hits.df$SNP %in% any.snp.intersect & gwas.hits.df$SpatialFDR < q.thresh, ]$LeadSNP)
+    q.csqtl.genes <- unlist(strsplit(snp.annot.df[snp.annot.df$SNP %in% q.leadsnp, ]$Nearest.Gene, split=",", fixed=TRUE))
+    
+    # intersect eGenes and csQTL nearest genes
+    q.overlap.genes <- intersect(q.csqtl.genes, q.egenes)
+    eqtl.overlap.list[[q]] <- q.egenes
+    
+    thresh.snp.list[[q]] <- data.frame("Threshold"=q.thresh, "N.Intersect"=length(q.snps), "N.eGenes"=length(q.egenes))
+}
+
+qtl.snp.df <- do.call(rbind.data.frame, thresh.snp.list)
+qtl.snp.df$Threshold <- ordered(qtl.snp.df$Threshold,
+                                levels=p.thresh)
+
+qtl.snp.df$Label <- paste0(qtl.snp.df$N.Intersect, "(", qtl.snp.df$N.eGenes, ")")
+
+ggplot(qtl.snp.df, aes(x=Threshold, y=N.Intersect)) +
+    geom_bar(stat='identity', colour='black') +
+    geom_text(aes(label=Label),
+              family="Roboto",
+              fontface="bold", nudge_y=2) +
+    theme_cowplot() +
+    labs(x="csQTL FDR threshold", y="eQTL overlap") +
+        theme(axis.title=element_text(face="bold"), 
+          axis.text=element_text(face="bold")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_eQTL-csQTL-overlap.png",
+       height=3, width=4, dpi=300, bg='white')
+```
+
+
+ 

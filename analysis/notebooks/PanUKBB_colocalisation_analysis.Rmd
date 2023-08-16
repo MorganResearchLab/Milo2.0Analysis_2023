@@ -1,0 +1,381 @@
+---
+title: "Milo2.0 Randolph _et al_ - GWAS Colocalisation results"
+output: html_notebook
+---
+
+# Introduction
+
+As a central goal of human genetics is to understand the genetic basis of disease, and csQTLs have the potential to inform this research goal, I have 
+performed colocalisation analysis between my csQTLs and a range of human traits. Specifically, I have used the data from the [pan-UKBB analysis](https://pan.ukbb.broadinstitute.org/). 
+
+```{r}
+library(SingleCellExperiment)
+library(miloR)
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(viridis)
+library(cowplot)
+library(ggsci)
+library(scico)
+library(stringr)
+library(RColorBrewer)
+```
+
+
+# Read in Milo object
+
+```{r}
+rand.ni.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_Milo.RDS")
+rand.ni.meta <- as.data.frame(colData(rand.ni.milo))
+rand.ni.meta$CellID <- colnames(rand.ni.milo)
+rand.ni.fr <- as.data.frame(reducedDim(rand.ni.milo, "UMAP"))
+rand.ni.fr$CellID <- colnames(rand.ni.milo)
+
+rand.ni.meta <- merge(rand.ni.meta, rand.ni.fr, by="CellID")
+```
+
+
+```{r}
+# use this for annotating the csQTL results
+glmm.da.res <- read.table("~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+                      sep="\t", header=TRUE, stringsAsFactors = FALSE)
+```
+
+A range of traits from the UK Biobank have been meta-analysed across ancestry-similar groups. It is the summary statistics from genome-wide analyses on these traits that we use to connect the 
+genetic signal underpinning each csQTL to human traits. Notably, not all traits will have sufficient observations to perform such a pan-ancestry meta-analysis, so we restrict our colocalisation 
+analysis to those traits with meta-analysis results, as detailed in the [pan-UKBB documentation](https://pan.ukbb.broadinstitute.org/docs/per-phenotype-files).
+
+In total I performed colocalisation analysis between 570 csQTLs and and 1230 UKBB traits. Colocalisation analysis using `coloc` returns posterior probabilities for the compound null hypothesis:
+
+* PP.H0 - neither trait is associated with the genetic locus
+* PP.H1 - the locus is associated with trait 1 only
+* PP.H2 - the locus is associated with trait 2 only
+* PP.H3 - the locus is associated with both traits, but the genetic signals differ
+
+We are interested in the final hypothesis posterior probability: PP.H4 that the locus is associated with both traits through a shared genetic signal. We need to be mindful that the 
+analysis I have run makes the assumption of a single causal variant/signal. This may not be the case, so should be considered when interpreting these results. Moreover, I have not performed 
+additional conditional analyses for csQTLs so there may be multiple genetic signals at each locus.
+
+__NB__: Some files are empty - I'll drop these.
+
+# Loading colocalisation results and quality control
+
+```{r, warning=FALSE}
+coloc.dir <- "~/Dropbox/GLMM/coloc.dir/"
+coloc.files <- list.files(coloc.dir, full.names=TRUE, pattern="UKBBcoloc")
+coloc.files <- coloc.files[file.size(coloc.files) > 1L]
+coloc.res.list <- list()
+
+for(CX in seq_along(coloc.files)){
+  CX.FILE <- coloc.files[CX]
+
+  tryCatch(expr={
+    cx.df <- read.table(CX.FILE, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+    }, error=function(err){
+      message(err)
+      cx.df <- NULL
+      return(cx.df)
+      })
+  
+  
+  if(!is.null(cx.df)){
+    coloc.res.list[[CX.FILE]] <- cx.df
+  }
+}
+
+coloc.res.df <- do.call(rbind.data.frame, coloc.res.list)
+# do some QC to remove the weird colocalisation results with sum(PP) > 1
+coloc.res.df$PP.Sum <- rowSums(coloc.res.df[, c(2:6)])
+coloc.res.df$csQTL <- paste(paste0("Nh", coloc.res.df$Nhood), coloc.res.df$LeadSNP, sep=":")
+coloc.res.df <- merge(coloc.res.df, glmm.da.res[, c("Nhood", "ident", "ident_fraction")], by='Nhood', all.x=TRUE)
+nrow(coloc.res.df)
+```
+
+We need to a little QC to check that the sum of posterior probabilities does not exceed 1 - this cannot be true as probabilities sum to 1 by definition.
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(coloc.res.df, aes(x=PP.Sum)) +
+  geom_histogram(colour='black', binwidth=0.05) +
+  theme_cowplot() +
+  labs(x="\u03A3 PP", y="Count") +
+  NULL
+```
+
+Hmm, there are some analyses with $\Sigma$ PP > 1. I'll remove these as there is clearly a problem with those analyses.
+
+```{r}
+coloc.res.df <- coloc.res.df[!coloc.res.df$PP.Sum > 1.5, ]
+nrow(coloc.res.df)
+```
+
+
+```{r}
+ggplot(coloc.res.df, aes(x=PP.H4.abf)) +
+  geom_histogram(colour='black', binwidth=0.05) +
+  theme_cowplot() +
+  labs(x="PP H4", y="Count") +
+  NULL
+```
+
+Here we can see the distribution of posterior probabilities for H4. First, we note that most traits are not associated with most csQTLs (makes sense). Secondly, we see an up-tick 
+with PP > 0.75. This could indicate a logical threshold on which to declare a trait and csQTL as colocalised.
+
+```{r}
+ggplot(coloc.res.df, aes(x=PP.H4.abf)) +
+  geom_histogram(colour='black', binwidth=0.05) +
+  geom_vline(xintercept=0.75, lty=2, colour='grey') +
+  theme_cowplot() +
+  labs(x="PP H4", y="Count") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/PanUKBB_PP4-histogram.png",
+       height=3, width=4.5, dpi=300, bg='white')
+```
+
+
+
+```{r}
+sum(coloc.res.df$PP.H4.abf >= 0.75)/nrow(coloc.res.df)
+sum(coloc.res.df$PP.H4.abf >= 0.75)
+```
+
+With this threshold we have `r sum(coloc.res.df$PP.H4.abf >= 0.75)` colocalisation events between csQTLs and pan-UKBB traits which represents ~1.3% of all analyses.
+
+For summarisation it is helpful to group the traits, particularly as we are interested in traits relevant to the immune system.
+
+```{r}
+coloc.res.df$PhenoCat <- NA
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<diet\\>)|(\\<consume\\>)|(\\<milk\\>)|(\\<coffee\\>)|(\\<drink\\>)|(\\<tea\\>)|(\\<fruit\\>)|(\\<intake\\>)|(\\<supplement\\>)|(\\<meal\\>)|(\\<alcohol\\>)|(\\<nutrition\\>)|(\\<vitamin\\>)|(\\<breastfed\\>)|(\\<wine\\>)|(\\<beer\\>)")] <- "Nutrition"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<questionnaire\\>)|(\\<mood\\>)|(\\<miserabl\\>)|(\\<irritability\\>)|(\\<feelings\\>)|(\\<tense\\>)|(\\<nerves\\>)|(\\<guilt\\>)|(\\<risk\\>)|(\\<addict\\>)|(\\<anxiety\\>)|(\\<worried\\>)|(\\<depression\\>)|(\\<interest\\>)|(\\<sexual\\>)|(\\<sex\\>)|(\\<harmed\\>)|(\\<mania\\>)|(\\<mental\\>)|(\\<distress\\>)|(\\<mental\\>)|(\\<addiction\\>)|(\\<alcoholism\\>)|(\\<happiness\\>)|(\\<happy\\>)|(\\<friendships\\>)|(\\<unenthusiastic\\>)|(\\<argumentative\\>)")] <- "Psychological"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<war\\>)|(\\<crime\\>)|(\\<violent\\>)|(\\<assault\\>)|(\\<job\\>)|(\\<work\\>)|(\\<shift\\>)|(\\<gap\\>)|(\\<diy\\>)|(\\<exercise\\>)|(\\<immigrated\\>)|(\\<address\\>)")] <- "Social"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<snoring\\>)|(\\<sleep\\>)|(\\<sleeping\\>)|(\\<waking\\>)|(\\<wake\\>)")] <- "Sleep"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<mri\\>)|(\\<imaging\\>)")] <- "Imaging"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<family\\>)|(\\<adopted\\>)|(\\<father\\>)|(\\<\\<mother\\>\\>)|(\\<\\<home\\>\\>)|(\\<children\\>)|(\\<siblings\\>)")] <- "Family"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<smoking\\>)|(\\<smoked\\>)|(\\<cigarette\\>)|(\\<tobacco\\>)")] <- "Smoking"
+
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<teeth\\>)|(\\<dental\\>)|(\\<pulp\\>)|(\\<periapical\\>)|(\\<gingival\\>)|(\\<gingiva\\>)|(\\<tongue\\>)|(\\<caries\\>)")] <- "Dental"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<cough\\>)|(\\<phlegm\\>)|(\\<chest\\>)|(\\<wheeze\\>)|(\\<fvc\\>)|(\\<fev\\>)|(\\<pef\\>)|(\\<inhaler\\>)|(\\<airway\\>)|(\\<bronchitis\\>)|(\\<pleural\\>)|(\\<respiratory\\>)|(\\<sputum\\>)|(\\<hemoptysis\\>)|(\\<breathing\\>)|(\\<pulmonary\\>)")] <- "Respiratory"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<hearing\\>)|(\\<ear\\>)|(\\<volume\\>)|(\\<tinnitus\\>)|(\\<noisy\\>)|(\\<loud\\>)")] <- "Auditory"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<uv\\>)|(\\<skin\\>)|(\\<solarium\\>)|(\\<cystitis\\>)|(\\<cellulitis\\>)|(\\<carbuncle\\>)|(\\<erythematous\\>)|(\\<hair\\>)|(\\<follicles\\>)|(\\<sebaceuos\\>)|(\\<subcutaneous\\>)|(\\<psoriasis\\>)")] <- "Dermal"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<falls\\>)|(\\<age\\>)")] <- "Ageing"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<weight\\>)|(\\<body\\>)|(\\<fat\\>)|(\\<mass\\>)|(\\<obesity\\>)|(\\<waist\\>)|(\\<hip\\>)|(\\<height\\>)")] <- "BodyMeasurements"
+
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<impedance\\>)|(\\<fracture\\>)|(\\<ankle\\>)|(\\<heel\\>)|(\\<bmd\\>)|(\\<movement\\>)|(\\<gait\\>)|(\\<knee\\>)|(\\<grip\\>)|(\\<strength\\>)|(\\<walking\\>)|(\\<hernia\\>)|(\\<disc\\>)|(\\<stenosis\\>)|(\\<foot\\>)|(\\<bunion\\>)|(\\<limb\\>)|(\\<back\\>)|(\\<sciatica\\>)|(\\<musculoskeletal\\>)|(\\<dislocation\\>)|(\\<fingers\\>)|(\\<toes\\>)|(\\<disk\\>)|(\\<dorsalgia\\>)|(\\<shoulder\\>)|(\\<gait\\>)|(\\<connective tissue\\>)")] <- "Musculoskeletal"
+
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<glasses\\>)|(\\<eye\\>)|(\\<retinal\\>)|(\\<retina\\>)|(\\<macula\\>)|(\\<glaucoma\\>)|(\\<cataract\\>)|(\\<blindness\\>)|(\\<visual\\>)|(\\<conjunctiva\\>)|(\\<lacrimal\\>)|(\\<astigmatism\\>)|(\\<meridian\\>)|(\\<cylindrical power\\>)|(\\<asymmetry index\\>)|(\\<regularity index\\>)|(\\<logmar\\>)|(\\<refractometry\\>)|(\\<keratometry\\>)|(\\<corneal\\>)|(\\<ocular\\>)|(\\<lachrymal\\>)")] <- "Opthalmology"
+
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<pregnancy\\>)|(\\<childbirth\\>)|(\\<delivery\\>)|(\\<fetus\\>)|(\\<amniotic\\>)|(\\<amnion\\>)|(\\<fetal\\>)|(\\<obstetrical\\>)|(\\<female\\>)|(\\<endometriosis\\>)|(\\<uterine\\>)|(\\<cervix\\>)|(\\<vagina\\>)|(\\<vulva\\>)|(\\<ovary\\>)|(\\<fallopian\\>)|(\\<uterus\\>)|(\\<uteri\\>)|(\\<menstrual\\>)|(\\<dysmenorrhea\\>)|(\\<menopausal\\>)|(\\<ovarian\\>)|(\\<oophorectomy\\>)|(\\<hysterectomy\\>)|(\\<mestrual\\>)|(\\<menstruation\\>)|(\\<vaginal\\>)|(\\<perimenopausal\\>)|(\\<abortion\\>)|(\\<miscarriage\\>)|(\\<stillbirth\\>)|(\\<maternal\\>)|(\\<pelvic\\>)|(\\<feotal\\>)|(\\<labour\\>)|(\\<perineal\\>)|(\\<postpartum\\>)|(\\<contraceptive\\>)|(\\<hrt\\>)|(\\<menopause\\>)")] <- "ObGyn"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<mammary\\>)")] <- "Mammary"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<pollution\\>)|(\\<road\\>)")] <- "Environment"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<operation\\>)|(\\<surgey\\>)|(\\<medical\\>)|(\\<medication\\>)|(\\<smear\\>)|(\\<electrolyte\\>)|(\\<hypovolemia\\>)|(\\<hospital\\>)|(\\<signal-to-noise\\>)|(\\<transplant\\>)|(\\<device\\>)|(\\<function\\>)|(\\<graft\\>)|(\\<implant\\>)|(\\<procedure\\>)|(\\<surgical\\>)|(\\<examination\\>)|(\\<rehabilitation\\>)|(\\<postsurgical\\>)")] <- "Medical"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<thyrotoxicosis\\>)|(\\<thryoid\\>)|(\\<diabetes\\>)|(\\<diabetic\\>)|(\\<pancreatic\\>)|(\\<glycemia\\>)|(\\<lipoid\\>)|(\\<lipidemia\\>)|(\\<insulin\\>)|(\\<hypothyroidism\\>)|(\\<hypoglycemia\\>)")] <- "Endocrine"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<gout\\>)|(\\<arthropathies\\>)|(\\<monoarthritis\\>)|(\\<arthropathy\\>)|(\\<spondylosis\\>)|(\\<synovium\\>)|(\\<tendon\\>)|(\\<enthesopathy\\>)|(\\<enthesopathies\\>)|(\\<synovitis\\>)|(\\<bursa\\>)|(\\<soft tissues\\>)|(\\<osteoarthrosis\\>)|(\\<osteoarthritis\\>)|(\\<joints\\>)|(\\<osteoporosis\\>)|(\\<osteopenia\\>)|(\\<polyarthrosis\\>)|(\\<coxarthrosis\\>)|(\\<gonarthrosis\\>)|(\\<arthrosis\\>)")] <- "Arthropathy"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<anemia\\>)|(\\<hemoglobinopathies\\>)|(\\<blood\\>)|(\\<haemoglobin\\>)|(\\<haematocrit\\>)|(\\<corpuscular\\>)|(\\<platelet\\>)|(\\<reticulocyte\\>)|(\\<haemoglobin\\>)|(\\<septicemia\\>)|(\\<hemorrhage\\>)|(\\<septicaemia\\>)|(\\<thalassaemia\\>)|(\\<haemorrhagic\\>)|(\\<anemias\\>)")] <- "Haematology"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<dementia\\>)|(\\<neurological\\>)|(\\<schizophrenia\\>)|(\\<pain\\>)|(\\<spinal\\>)|(\\<migraine\\>)|(\\<headache\\>)|(\\<hemiplegia\\>)|(\\<epilepsy\\>)|(\\<plexus\\>)|(\\<vertigo\\>)|(\\<syncope\\>)|(\\<nausea\\>)|(\\<cognitive\\>)|(\\<cerebrovascular\\>)|(\\<headaches\\>)|(\\<neuralgia\\>)")] <- "Neurological"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<albumin\\>)|(\\<creatinine\\>)|(\\<potassium\\>)|(\\<phosphatase\\>)|(\\<sodium\\>)|(\\<aminotransferase\\>)|(\\<apolipoprotein\\>)|(\\<bilirubin\\>)|(\\<urea\\>)|(\\<calcium\\>)|(\\<cholesterol\\>)|(\\<c-reactive\\>)|(\\<cystatin\\>)|(\\<glutamyltransferase\\>)|(\\<glucose\\>)|(\\<igf-1\\>)|(\\<oestradiol\\>)|(\\<shbg\\>)|(\\<testosterone\\>)|(\\<protein\\>)|(\\<triglycerides\\>)|(\\<urate\\>)|(\\<chemistry\\>)|(\\<lipoprotein\\>)|(\\<phosphate\\>)")] <- "Biochemistry"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<stomach\\>)|(\\<hemorrhoids\\>)|(\\<esophagus\\>)|(\\<esophagitis\\>)|(\\<gerd\\>)|(\\<reflux\\>)|(\\<peptic\\>)|(\\<gastric\\>)|(\\<dysphagia\\>)|(\\<gastritis\\>)|(\\<duodenum\\>)|(\\<gastroenteritis\\>)|(\\<intestinal\\>)|(\\<digestive\\>)|(\\<bowel\\>)|(\\<anal\\>)|(\\<rectal\\>)|(\\<peritoneum\\>)|(\\<peritoneal\\>)|(\\<rectum\\>)|(\\<anus\\>)|(\\<stool\\>)|(\\<vomiting\\>)|(\\<oesophageal\\>)|(\\<gastritis\\>)|(\\<colitis\\>)|(\\<diverticular\\>)|(\\<intestinal\\>)|(\\<intestine\\>)|(\\<constipation\\>)|(\\<diverticulosis\\>)")] <- "Gastrointestinal"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<heart\\>)|(\\<hypertension\\>)|(\\<vein\\>)|(\\<intima-medial\\>)|(\\<hypercholesterolemia\\>)|(\\<stroke\\>)|(\\<diastolic\\>)|(\\<systolic\\>)|(\\<angina\\>)|(\\<myocardial\\>)|(\\<atherosclerosis\\>)|(\\<infarction\\>)|(\\<cardiomegaly\\>)|(\\<precordial\\>)|(\\<pulse\\>)|(\\<carditis\\>)|(\\<cardiac\\>)|(\\<bundle\\>)|(\\<atrial\\>)|(\\<cardia\\>)|(\\<palpitations\\>)|(\\<vascular\\>)|(\\<ischemia\\>)|(\\<phlebitis\\>)|(\\<thrombo\\>)|(\\<vein\\>)|(\\<hypotension\\>)|(\\<circulatory\\>)|(\\<arteries\\>)|(\\<ecg\\>)|(\\<ischaemic\\>)|(\\<embolism\\>)|(\\<ventricular\\>)|(\\<varicose\\>)|(\\<aortic\\>)|(\\<atrioventricular\\>)|(\\<tachycardia\\>)")] <- "Cardiovascular"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<kidney\\>)|(\\<renal\\>)|(\\<nephritis\\>)|(\\<ureters\\>)|(\\<cystitis\\>)|(\\<hematuria\\>)|(\\<urinary\\>)|(\\<bladder\\>)|(\\<urine\\>)|(\\<urination\\>)|(\\<polyuria\\>)|(\\<urethral\\>)")] <- "Renal"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<liver\\>)|(\\<cirrhosis\\>)|(\\<cholecystitis\\>)|(\\<cholelithiasis\\>)|(\\<biliary\\>)")] <- "Hepatology"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<malaise\\>)|(\\<fatigue\\>)")] <- "Systemic"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<head\\>)|(\\<neck\\>)|(\\<goitre\\>)|(\\<nose\\>)|(\\<sinuses\\>)")] <- "HeadAndNeck"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<poisoning\\>)|(\\<radiation\\>)|(\\<exposure\\>)")] <- "Toxicology"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<metabolism\\>)|(\\<hyperlipidemia\\>)")] <- "Metabolic"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<candidiasis\\>)|(\\<infection\\>)|(\\<coli\\>)|(\\<pneumonia\\>)|(\\<bacterial\\>)|(\\<viral\\>)|(\\<enteritis\\>)|(\\<streptococcus\\>)|(\\<infectious\\>)")] <- "Infection"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<leukocyte\\>)|(\\<asthama\\>)|(\\<allergic\\>)|(\\<hayfever\\>)|(\\<lymphocyte\\>)|(\\<monocyte\\>)|(\\<neutrophill\\>)|(\\<eosinophil\\>)|(\\<basophil\\>)|(\\<rheumatoid\\>)|(\\<inflammation\\>)|(\\<tonsillitis\\>)|(\\<sarcoidosis\\>)|(\\<lymph\\>)|(\\<allergy\\>)|(\\<eosinophill\\>)|(\\<basophill\\>)|(\\<asthma\\>)")] <- "ImmuneSystem"
+coloc.res.df$PhenoCat[is.na(coloc.res.df$PhenoDescription)] <- "Pharmacological"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<medication\\>)|(\\<medicaments\\>)|(\\<drugs\\>)")] <- "Pharmacological"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<neoplasm\\>)|(\\<malignant\\>)|(\\<cancer\\>)|(\\<malignancy\\>)|(\\<chemotherapy\\>)|(\\<lipoma\\>)|(\\<benign\\>)|(\\<leiomyoma\\>)")] <- "CancerOrTumour"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription),
+                            pattern="(\\<injury\\>)|(\\<wound\\>)")] <- "Trauma"
+coloc.res.df$PhenoCat[grepl(str_to_lower(coloc.res.df$PhenoDescription), 
+                            pattern="(\\<psa\\>)|(\\<testis\\>)|(\\<prostate\\>)|(\\<penis\\>)|(\\<prepuce\\>)|(\\<prolapse\\>)|(\\<genital\\>)|(\\<urinary\\>)")] <- "Genitourinary"
+table(coloc.res.df$PhenoCat)
+```
+
+# Visualising colocalisation results
+
+Let's line up the csQTLs on the x-axis and see how many unique traits colocalise with each.
+
+```{r}
+coloc.n.df <- coloc.res.df %>% group_by(LeadSNP, Nhood, csQTL) %>% summarise("N.Coloc.Traits"=sum(PP.H4.abf >= 0.75))
+coloc.ind.df <- coloc.res.df %>% group_by(LeadSNP, Nhood, csQTL) %>% summarise("N.Ind.Traits"=sum(PP.H3.abf >= 0.75))
+
+# add the cell type identity to these csQTLs
+coloc.sum.df <- merge(coloc.n.df, coloc.ind.df, by=c("LeadSNP", "Nhood", "csQTL"))
+coloc.sum.df <- merge(coloc.sum.df, glmm.da.res[, c("Nhood", "ident", "ident_fraction")], by='Nhood', all.x=TRUE)
+```
+
+
+```{r, fig.height=3.5, fig.width=4.75}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+ggplot(coloc.sum.df, aes(x=reorder(csQTL, -N.Coloc.Traits), y=N.Coloc.Traits, fill=ident)) +
+  geom_jitter(colour='black', shape=21,  size=3, position=position_jitter(height=0, width=0.1)) +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) +
+  scale_fill_manual(values=ct_cols) +
+  labs(x="csQTLs", y="#Colocalised traits (PP H4 \u2265 0.75)") +
+  guides(fill=guide_legend(title="Cell type", override.aes=list(size=3))) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/PanUKBB-NColocTraits_distribution.png",
+       height=3.5, width=4.75, dpi=300, bg='white')
+```
+
+We can also plot the number of colocalised traits vs. the number of independent loci, i.e. PP H3 >= 0.75.
+
+```{r, fig.height=4, fig.width=4.5}
+ggplot(coloc.sum.df, aes(y=N.Coloc.Traits, x=N.Ind.Traits, colour=ident)) +
+  geom_point(size=1) +
+  theme_cowplot( ) +
+  labs(x="#Independent loci (PP H3\u2265 0.75)", y="#Colocalised loci (PP H4\u2265 0.75)") +
+  scale_colour_manual(values=ct_cols) +
+  guides(colour=guide_legend(title="Cell type", override.aes=list(size=3, shape=15))) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/PanUKBB-PP4vsPP3-scatter.png",
+       height=4, width=4.5, dpi=300, bg='white')
+```
+
+One of the csQTLs is colocalised with > 30 traits - it seems like something of an outlier. Which csQTL is this?
+
+```{r}
+coloc.sum.df[coloc.sum.df$N.Coloc.Traits > 30, ]
+```
+
+It'll be interesting to see if this also maps/colocalises with any eQTLs, either in the eQTL catalogue or the fine-grained nhood eQTLs. What traits does it colocalise with?
+
+```{r}
+length(unique(coloc.res.df[coloc.res.df$PP.H4.abf >= 0.75, ]$PhenoDescription))
+unique(coloc.res.df[coloc.res.df$Nhood %in% c(3151) & coloc.res.df$LeadSNP %in% c("4_9037867_A_G") & coloc.res.df$PP.H4.abf >= 0.75, ]$PhenoCat)
+```
+
+There is quite a range of traits here, however, some are interesting in that they (indirectly) relate to the immune system, e.g. rheumatoid arthritis, 
+rheumatoid factor (an autoantibody for RA), cancer (failure of immune surveillance), gout (auto-inflammtory), diabetes (type 1 or type 2?), 
+bacterial enteritits, monocyte and neutrophil percentage. My conclusion would be that this is a highly pleiotropic locus as these are very 
+diverse traits that appear to go beyond the immune system. On a side note, there are quite a few digestive-system related traits here as well.
+
+```{r}
+coloc.res.df$CHR <- as.numeric(gsub(coloc.res.df$LeadSNP, pattern="([0-9+])_([0-9]+)_([ATCG]+)_([ATCG])",
+                                    replacement="\\1"))
+coloc.res.df$CHR.Fac <- factor(coloc.res.df$CHR, levels=c(1:19))
+
+ggplot(coloc.res.df, aes(x=reorder(csQTL, CHR), 
+                         y=PhenoDescription, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text=element_blank(), axis.ticks=element_blank()) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1) +
+  # facet_wrap(~CHR.Fac, scales="free_x") +
+  labs(x="csQTLs", y="PanUKBB traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+```
+
+It is hard to discern patterns in this heatmap. Grouping the traits into immune/non-immune might be more useful.
+
+```{r, fig.height=12, fig.width=12}
+coloc.res.df$PhenoPretty <- str_wrap(coloc.res.df$PhenoDescription, width=80)
+coloc.res.df$PhenoPretty <- factor(coloc.res.df$PhenoPretty,
+                                   levels=rev(unique(coloc.res.df$PhenoPretty)[order(unique(coloc.res.df$PhenoPretty))]))
+
+ggplot(coloc.res.df[coloc.res.df$PhenoCat %in% c("ImmuneSystem", "Infection"), ], 
+       aes(x=reorder(csQTL, CHR), 
+           y=PhenoPretty, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks=element_blank(),
+        text=element_text(family="Roboto", size=12), strip.text=element_text(size=14),
+        strip.background=element_rect(colour='white', fill='white')) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1, breaks=c(0, 0.5, 1), limits=c(0, 1)) +
+  # facet_wrap(~PhenoCat, scales="free_y", ncol=1) +
+  labs(x="csQTLs", y="PanUKBB traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/PanUKBB_csQTLs_coloc-ImmuneSystem_Infection-heatmap.png",
+       height=12, width=12, dpi=300, bg='white')
+```
+
+Perhaps I should subset this to the traits and csQTLs that have any PP.H4 >= 0.75?
+
+```{r, fig.height=2, fig.width=12}
+coloc.res.df$PhenoPretty <- str_wrap(coloc.res.df$PhenoDescription, width=80)
+coloc.res.df$PhenoPretty <- factor(coloc.res.df$PhenoPretty,
+                                   levels=rev(unique(coloc.res.df$PhenoPretty)[order(unique(coloc.res.df$PhenoPretty))]))
+immune.csqtls <- coloc.res.df$csQTL[coloc.res.df$PP.H4.abf >= 0.25 & coloc.res.df$PhenoCat %in% c("ImmuneSystem", "Infection")]
+coloc.traits <- coloc.res.df$PhenoDescription[coloc.res.df$PP.H4.abf >= 0.75 & coloc.res.df$PhenoCat %in% c("ImmuneSystem", "Infection")]
+
+ggplot(coloc.res.df[coloc.res.df$PhenoDescription %in% coloc.traits & coloc.res.df$csQTL %in% immune.csqtls, ], 
+       aes(x=reorder(csQTL, CHR), 
+           y=PhenoPretty, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks=element_blank(),
+        text=element_text(family="Roboto", size=14), strip.text=element_text(size=16),
+        strip.background=element_rect(colour='white', fill='white')) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1, breaks=c(0, 0.5, 1), limits=c(0, 1)) +
+  facet_wrap(~PhenoCat, scales="free_y", ncol=1) +
+  labs(x="csQTLs", y="PanUKBB traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/PanUKBB_csQTLs_coloc-Immune_Infection-heatmap.png",
+       height=12, width=12, dpi=300, bg='white')
+```
+
+I'll save the colocalised csQTL-GWAS trait results with PP H4 >= 0.75.
+
+```{r}
+write.table(coloc.res.df[!(grepl(coloc.res.df$PhenoDescription, pattern="\\t")) & coloc.res.df$PP.H4.abf >= 0.75,
+                         !colnames(coloc.res.df) %in% c("PhenoPretty")],
+            file="~/Dropbox/GLMM/results/PanUKBB_colocPP4_results.tsv",
+            quote=FALSE, sep="\t", row.names=FALSE)
+```
+

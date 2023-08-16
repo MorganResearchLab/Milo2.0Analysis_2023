@@ -1,0 +1,284 @@
+---
+title: "Milo2.0 Randolph _et al_ - GWAS Colocalisation results - FinnGen"
+output: html_notebook
+---
+
+# Introduction
+
+As a central goal of human genetics is to understand the genetic basis of disease, and csQTLs have the potential to inform this research goal, I have 
+performed colocalisation analysis between my csQTLs and a range of human traits. Specifically, I have used the data from the [FinnGen study](https://www.finngen.fi/en).
+
+```{r}
+suppressMessages({
+library(SingleCellExperiment)
+library(miloR)
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(viridis)
+library(cowplot)
+library(ggsci)
+library(scico)
+library(stringr)
+library(RColorBrewer)
+})
+```
+
+
+# Read in Milo object
+
+```{r}
+rand.ni.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_Milo.RDS")
+rand.ni.meta <- as.data.frame(colData(rand.ni.milo))
+rand.ni.meta$CellID <- colnames(rand.ni.milo)
+rand.ni.fr <- as.data.frame(reducedDim(rand.ni.milo, "UMAP"))
+rand.ni.fr$CellID <- colnames(rand.ni.milo)
+
+rand.ni.meta <- merge(rand.ni.meta, rand.ni.fr, by="CellID")
+```
+
+
+```{r}
+# use this for annotating the csQTL results
+glmm.da.res <- read.table("~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+                      sep="\t", header=TRUE, stringsAsFactors = FALSE)
+```
+
+A range of traits from the FinnGen study have been analysed, and it is the summary statistics from these GWAS that I will use here to connect the 
+genetic signal underpinning each csQTL to human traits.
+
+In total I performed colocalisation analysis between 570 csQTLs and and 905 FinnGen traits. Colocalisation analysis using `coloc` returns posterior probabilities for the compound null hypothesis:
+
+* PP.H0 - neither trait is associated with the genetic locus
+* PP.H1 - the locus is associated with trait 1 only
+* PP.H2 - the locus is associated with trait 2 only
+* PP.H3 - the locus is associated with both traits, but the genetic signals differ
+
+We are interested in the final hypothesis posterior probability: PP.H4 that the locus is associated with both traits through a shared genetic signal. We need to be mindful that the 
+analysis I have run makes the assumption of a single causal variant/signal. This may not be the case, so should be considered when interpreting these results. Moreover, I have not 
+performed additional conditional analyses for csQTLs so there may well be multiple genetic signals at each locus.
+
+__NB__: Some files are empty - drop these.
+
+# Loading colocalisation results and quality control
+
+```{r, warning=FALSE}
+coloc.dir <- "/Users/s08mm2/Dropbox/GLMM/coloc.dir/"
+coloc.files <- list.files(coloc.dir, full.names=TRUE, pattern="FinnGen")
+coloc.files <- coloc.files[file.size(coloc.files) != 0L]
+coloc.res.list <- list()
+
+for(CX in seq_along(coloc.files)){
+  CX.FILE <- coloc.files[CX]
+  CX.cat <- gsub(CX.FILE, pattern=paste0("(",coloc.dir, "/", "MiloGWAS)-(\\S+)_(\\S+)_FinnGencoloc\\.tsv"), replacement="\\2")
+  CX.cat <- gsub(CX.cat, pattern="(/Users/s08mm2/Dropbox/GLMM/coloc.dir//)(MiloGWAS_)([[:ascii:]]+)(_FinnGencoloc\\.tsv)", replacement="Immune_\\3", perl=TRUE)
+  
+  tryCatch(expr={
+    cx.df <- read.table(CX.FILE, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+    }, error=function(err){
+      message(err)
+      cx.df <- NULL
+      })
+  
+  cx.df$PhenoCat <- CX.cat
+  
+  if(!is.null(cx.df)){
+    coloc.res.list[[CX.FILE]] <- cx.df
+  }
+}
+
+coloc.res.df <- do.call(rbind.data.frame, coloc.res.list)
+# do some QC to remove the weird colocalisation results with sum(PP) > 1
+coloc.res.df$PP.Sum <- rowSums(coloc.res.df[, c(2:6)])
+coloc.res.df$csQTL <- paste(paste0("Nh", coloc.res.df$Nhood), coloc.res.df$LeadSNP, sep=":")
+coloc.res.df <- merge(coloc.res.df, glmm.da.res[, c("Nhood", "ident", "ident_fraction")], by='Nhood', all.x=TRUE)
+
+# only need the first part of this for the categories
+coloc.res.df$PhenoCat <- unlist(lapply(strsplit(coloc.res.df$PhenoCat, split="_", fixed=TRUE),
+                                       FUN=function(CP) CP[1]))
+nrow(coloc.res.df)
+```
+
+We need to a little QC to check that the sum of posterior probabilities does not exceed 1 - this cannot be true as probabilities sum to 1 by definition.
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(coloc.res.df, aes(x=PP.Sum)) +
+  geom_histogram(colour='black', binwidth=0.05) +
+  theme_cowplot() +
+  labs(x="\u03A3 PP", y="Count") +
+  NULL
+```
+
+We don't seem to have any issues with sum of posteriors > 1.
+
+```{r}
+ggplot(coloc.res.df, aes(x=PP.H4.abf)) +
+  geom_histogram(colour='black', binwidth=0.05) +
+  geom_vline(xintercept=0.75, lty=2, colour='grey') +
+  theme_cowplot() +
+  labs(x="PP H4", y="Count") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/FinnGen_PP4-histogram.png",
+       height=3, width=4.5, dpi=300, bg='white')
+```
+
+Here we can see the distribution of posterior probabilities for H4. First, we note that most traits are not associated with most csQTLs (makes sense). I will use the same threshold on PP H4 
+as I did for the Pan-UKBB analysis, i.e. PP H4 >= 0.75.
+
+```{r}
+sum(coloc.res.df$PP.H4.abf >= 0.75)/nrow(coloc.res.df)
+sum(coloc.res.df$PP.H4.abf >= 0.75)
+```
+
+With this threshold we have `r sum(coloc.res.df$PP.H4.abf >= 0.75)` colocalisation events between csQTLs and pan-UKBB traits which represents ~0.11% of all analyses.
+
+For summarisation it is helpful to group the traits, particularly as we are interested in traits relevant to the immune system. 
+
+```{r}
+
+table(coloc.res.df$PhenoCat)
+```
+
+# Visualising colocalisation results
+
+Let's line up the csQTLs on the x-axis and see how many unique traits colocalise with each.
+
+```{r}
+coloc.n.df <- coloc.res.df %>% group_by(LeadSNP, Nhood, csQTL) %>% summarise("N.Coloc.Traits"=sum(PP.H4.abf >= 0.75))
+coloc.ind.df <- coloc.res.df %>% group_by(LeadSNP, Nhood, csQTL) %>% summarise("N.Ind.Traits"=sum(PP.H3.abf >= 0.75))
+
+# add the cell type identity to these csQTLs
+coloc.sum.df <- merge(coloc.n.df, coloc.ind.df, by=c("LeadSNP", "Nhood", "csQTL"))
+coloc.sum.df <- merge(coloc.sum.df, glmm.da.res[, c("Nhood", "ident", "ident_fraction")], by='Nhood', all.x=TRUE)
+```
+
+
+```{r, fig.height=3.5, fig.width=4.75}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+ggplot(coloc.sum.df, aes(x=reorder(csQTL, -N.Coloc.Traits), y=N.Coloc.Traits, fill=ident)) +
+  geom_jitter(colour='black', shape=21,  size=3, position=position_jitter(height=0, width=0.1)) +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) +
+  scale_fill_manual(values=ct_cols) +
+  labs(x="csQTLs", y="#Colocalised traits (PP H4 \u2265 0.75)") +
+  guides(fill=guide_legend(title="Cell type", override.aes=list(size=3))) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/FinnGen-NColocTraits_distribution.png",
+       height=3.5, width=4.75, dpi=300, bg='white')
+```
+
+We can also plot the number of colocalised traits vs. the number of independent loci, i.e. PP H3 >= 0.75.
+
+```{r, fig.height=4, fig.width=4.5}
+ggplot(coloc.sum.df, aes(y=N.Coloc.Traits, x=N.Ind.Traits, colour=ident)) +
+  geom_point(size=1) +
+  theme_cowplot( ) +
+  labs(x="#Independent loci (PP H3\u2265 0.75)", y="#Colocalised loci (PP H4\u2265 0.75)") +
+  scale_colour_manual(values=ct_cols) +
+  guides(colour=guide_legend(title="Cell type", override.aes=list(size=3, shape=15))) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/FinnGen-PP4vsPP3-scatter.png",
+       height=4, width=4.5, dpi=300, bg='white')
+```
+
+One of the csQTLs is colocalised with > 20 traits - it seems like something of an outlier. Which csQTL is this?
+
+```{r}
+coloc.sum.df[coloc.sum.df$N.Coloc.Traits > 15, ]
+```
+
+It'll be interesting to see if this also maps/colocalises with any eQTLs, either in the eQTL catalogue or the fine-grained nhood eQTLs. What traits does it colocalise with?
+
+```{r}
+length(unique(coloc.res.df[coloc.res.df$PP.H4.abf >= 0.75, ]$FinnGenPheno))
+unique(coloc.res.df[coloc.res.df$Nhood %in% c(1314) & coloc.res.df$LeadSNP %in% c("12_123251537_G_T") & coloc.res.df$PP.H4.abf >= 0.75, ]$FinnGenPheno)
+```
+
+There is quite a range of traits here, however, some are interesting in that they (indirectly) relate to the immune system, e.g. arthropathies, 
+asthma, gout (auto-inflammtory), diabetes (type 2?).
+
+```{r}
+coloc.res.df$CHR <- as.numeric(gsub(coloc.res.df$LeadSNP, pattern="([0-9+])_([0-9]+)_([ATCG]+)_([ATCG])",
+                                    replacement="\\1"))
+coloc.res.df$CHR.Fac <- factor(coloc.res.df$CHR, levels=c(1:19))
+
+ggplot(coloc.res.df, aes(x=reorder(csQTL, CHR), 
+                         y=FinnGenPheno, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text=element_blank(), axis.ticks=element_blank()) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1) +
+  # facet_wrap(~CHR.Fac, scales="free_x") +
+  labs(x="csQTLs", y="FinnGen traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+```
+
+It is hard to discern patterns in this heatmap. Grouping the traits into immune/non-immune might be more useful.
+
+```{r, fig.height=12, fig.width=12}
+coloc.res.df$PhenoPretty <- str_wrap(str_to_sentence(coloc.res.df$FinnGenPheno), width=80)
+coloc.res.df$PhenoPretty <- factor(coloc.res.df$PhenoPretty,
+                                   levels=rev(unique(coloc.res.df$PhenoPretty)[order(unique(coloc.res.df$PhenoPretty))]))
+
+
+ggplot(coloc.res.df[coloc.res.df$PhenoCat %in% c("Autoimmune", "Immune", "Rheuma"), ], 
+       aes(x=reorder(csQTL, CHR), 
+           y=PhenoPretty, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks=element_blank(),
+        text=element_text(family="Roboto", size=12), strip.text=element_text(size=14),
+        strip.background=element_rect(colour='white', fill='white')) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1, breaks=c(0, 0.5, 1), limits=c(0, 1)) +
+  facet_wrap(~PhenoCat, scales="free_y", ncol=1) +
+  labs(x="csQTLs", y="FinnGen traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+```
+
+Perhaps I should subset this to the traits and csQTLs that have any PP.H4 >= 0.75?
+
+```{r, fig.height=12, fig.width=12}
+immune.csqtls <- coloc.res.df$csQTL[coloc.res.df$PP.H4.abf >= 0.25 & coloc.res.df$PhenoCat %in% c("Autoimmune", "Immune", "Rheuma")]
+coloc.traits <- coloc.res.df$FinnGenPheno[coloc.res.df$PP.H4.abf >= 0.75 & coloc.res.df$PhenoCat %in% c("Autoimmune", "Immune", "Rheuma")]
+
+ggplot(dplyr:::distinct(coloc.res.df[coloc.res.df$FinnGenPheno %in% coloc.traits & coloc.res.df$csQTL %in% immune.csqtls, ], csQTL, FinnGenPheno, .keep_all=TRUE), 
+       aes(x=reorder(csQTL, CHR), 
+           y=PhenoPretty, fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(axis.text.x=element_blank(), axis.ticks=element_blank(),
+        text=element_text(family="Roboto", size=14), strip.text=element_text(size=16),
+        strip.background=element_rect(colour='white', fill='white')) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1, breaks=c(0, 0.5, 1), limits=c(0, 1)) +
+  facet_wrap(~PhenoCat, scales="free_y", ncol=1) +
+  labs(x="csQTLs", y="FinnGen traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/FinnGen_csQTLs_coloc-Immune_Infection-heatmap.png",
+       height=12, width=12, dpi=300, bg='white')
+```
+
+I'll save the colocalised csQTL-GWAS trait results with PP H4 >= 0.75.
+
+```{r}
+write.table(coloc.res.df[coloc.res.df$PP.H4.abf >= 0.75,
+                         !colnames(coloc.res.df) %in% c("PhenoPretty")],
+            file="~/Dropbox/GLMM/results/FinnGen_colocPP4_results.tsv",
+            quote=FALSE, sep="\t", row.names=FALSE)
+```
+

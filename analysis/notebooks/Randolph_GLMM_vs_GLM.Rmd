@@ -1,0 +1,1953 @@
+---
+title: "Randolph _et al_. DA testing GLMM vs. GLM"
+output: html_notebook
+---
+
+For this analysis I will use the batch as either a fixed or random effect and compare the results between the 2 models. In the first instance I will separately analyse the 
+uninfected control and IAV infected cells to mitigate against complete separation in the model. In these models the test variable will be inferred AFR ancestry.
+
+Secondly, I will compare the full dataset to identify DA nhoods between the infected and control samples, here the random effect variable will be batch and infection will be 
+the test variable. Secondary to both of these models, I will include a crude GRM computed from a random selection of genome-wide SNPs to adjust for the ancestry dependence between 
+individuals.
+
+```{r}
+library(SingleCellExperiment)
+library(miloR)
+library(Matrix)
+library(MatrixGenerics)
+library(ggplot2)
+library(ggsci)
+library(cowplot)
+library(scales)
+library(scattermore)
+library(BiocParallel)
+library(RColorBrewer)
+library(tidyr)
+library(edgeR)
+library(biomaRt)
+library(ComplexHeatmap)
+library(ggrepel)
+library(dplyr)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+biomaRt.connection <- useMart("ensembl", "hsapiens_gene_ensembl")
+
+gene.df <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "chromosome_name"),
+                 mart=biomaRt.connection)
+rownames(gene.df) <- gene.df$ensembl_gene_id
+```
+
+# Flu-infected PBMCs
+
+```{r}
+rand.flu.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_flu_Milo.RDS")
+rand.flu.meta <- as.data.frame(colData(rand.flu.milo))
+rand.flu.meta$CellID <- colnames(rand.flu.milo)
+rand.flu.fr <- as.data.frame(reducedDim(rand.flu.milo, "UMAP"))
+rand.flu.fr$CellID <- colnames(rand.flu.milo)
+
+rand.flu.meta <- merge(rand.flu.meta, rand.flu.fr, by="CellID")
+```
+
+
+```{r}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.flu.meta$ident)))
+names(ct_cols) <- unique(rand.flu.meta$ident)
+
+ggplot(rand.flu.meta, aes(x=UMAP1, y=UMAP2, colour=ident)) +
+    geom_scattermore(pointsize=0.75) +
+    scale_colour_manual(values=ct_cols) +
+    theme_cowplot() +
+    guides(colour=guide_legend(title="Cell type", override.aes = list(size=3.5, shape=15))) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Inf_cellTypes-UMAP.png",
+       height=3.2, width=5, dpi=300, bg='white')
+```
+
+```{r, fig.heigh=4.5, fig.width=9}
+ggplot(rand.flu.meta, aes(x=UMAP1, y=UMAP2)) +
+    geom_scattermore(data=rand.flu.meta[, c("UMAP1", "UMAP2")],
+                     pointsize=0.5, colour='grey80') +
+    geom_scattermore(aes(colour=SOC_infection_status), pointsize=0.75) +
+    scale_colour_d3() +
+    facet_wrap(~SOC_infection_status) +
+    theme_cowplot()
+```
+
+We should inspect the mean-variance relationship in the nhoods counts matrix.
+
+```{r}
+mu.var.df <- data.frame("Mean"=rowMeans2(nhoodCounts(rand.flu.milo)),
+                        "Var"=rowVars(nhoodCounts(rand.flu.milo)))
+
+ggplot(mu.var.df, aes(x=Mean, y=Var)) +
+    geom_point() +
+    geom_smooth() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_Inf_MeanVar.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+The red line denotes the x=y, i.e. Poisson expected variance line. Clearly there is overdispersion so an overdispersed model is appropriate. The blue line is the best fit GAM using 
+a cubic spline with shrinkage. This probably isn't too far off the dispersion estimation used by edgeR.
+
+```{r}
+ggplot(mu.var.df, aes(x=Mean, y=Var)) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    geom_smooth() +
+    theme_cowplot() +
+    scale_y_log10() +
+    scale_x_log10() +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_Inf_logMeanVar.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+This is the same plot as above, on a log scale.
+
+```{r}
+plotNhoodSizeHist(rand.flu.milo)
+```
+
+## DA testing with batch adjustment
+
+```{r}
+test.meta <- rand.flu.meta[rand.flu.meta$SOC_infection_status %in% c("flu"), 
+                        c("orig.ident", "batchID", "SOC_indiv_ID", "SOC_infection_status", "SOC_genetic_ancestry",
+                          "CEU", "YRI", "sample_condition", "ident", "CellID") ]
+test.meta <- test.meta[!duplicated(test.meta$sample_condition), ]
+rownames(test.meta) <- test.meta$SOC_indiv_ID
+table(test.meta$batchID)
+```
+
+Setup the design matrix and test nhoods. Should this just be on a few hundred nhoods for the sake of speed?
+
+```{r, warning=FALSE}
+param <- MulticoreParam(workers=6)
+register(param)
+set.seed(42)
+
+glmm.res <- testNhoods(rand.flu.milo, design.df=test.meta, 
+                       design= ~ SOC_genetic_ancestry + (1|batchID), reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param)
+table(glmm.res$SpatialFDR < 0.1)
+head(glmm.res)
+```
+
+Plot the results in an MA plot to check for sanity. We want to see LFC values distributed around 0.
+
+```{r, fig.height=4, fig.width=6.5}
+ggplot(glmm.res, aes(x=logCPM, y=logFC, colour=SpatialFDR < 0.1)) +
+    geom_point() +
+    theme_cowplot() +
+    scale_colour_manual(values=c("black", "red")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_Inf_batchRandVar-MAplot.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+
+```{r, warning=FALSE}
+set.seed(42)
+
+glm.res <- testNhoods(rand.flu.milo, design.df=test.meta, 
+                       design= ~ batchID + SOC_genetic_ancestry, reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param)
+table(glm.res$SpatialFDR < 0.1)
+head(glm.res)
+```
+
+
+```{r}
+ggplot(glm.res, aes(x=logCPM, y=logFC, colour=SpatialFDR < 0.1)) +
+    geom_point() +
+    theme_cowplot() +
+    scale_colour_manual(values=c("black", "red")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_Inf_BatchFixedVar-MAplot.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+Plot the logFC on the UMAP.
+
+```{r}
+plotNhoodGraphDA(rand.flu.milo, milo_res=glm.res) +
+        guides(size=FALSE, edge_width=FALSE)
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Inf_BatchFixedVar_GLMM-NhoodGraph.png",
+       height=3.25, width=4, bg='white', dpi=300)
+```
+
+
+Compare the results between the GLM and GLMM.
+
+```{r, fig.height=5, fig.width=6}
+glm.glmm.comp <- merge(glm.res, glmm.res, by=c("Nhood"))
+glm.glmm.comp$Sig <- "None"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "Both"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y >= 0.1] <- "GLM"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x >= 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "GLMM"
+
+ggplot(glm.glmm.comp, aes(x=logFC.x, y=logFC.y, colour=Sig)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x="GLM LFC", y="GLMM LFC") +
+    scale_colour_manual(values=c("red", "orange", "purple", "grey")) +
+    theme(axis.text=element_text(size=14), axis.title=element_text(size=16)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Inf_GLMvsGLMM_LFC.png",
+       height=5, width=6, bg='white', dpi=300)
+```
+
+These results are extremely concordant - brilliant! This also shows that we have more power to identify DA nhoods with the GLMM (assuming these aren't just false discoveries). I'll 
+compare the GLMM DA results to the annotated clusters.
+
+```{r, fig.width=7, fig.height=5}
+glmm.res <- annotateNhoods(rand.flu.milo, glmm.res, "ident")
+
+plotDAbeeswarm(glmm.res, alpha=0.1, group.by="ident") +
+    labs(y="Log fold change", x="Cell type") +
+    theme(axis.text=element_text(size=14), axis.title=element_text(size=16)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Inf_BatchRandVar_GLMM-beeswarm.png",
+       height=3.25, width=4, bg='white', dpi=300)
+
+
+```
+These results suggest that individuals classified as AFR ancestry have more NK cells, infected monocytes and a subset of CD4+ T cells and fewer CD8+ T cells compared to individuals 
+classified as EUR ancestry. This is only in the flu-infected PBMCs.
+
+```{r, fig.height=5, fig.width=7.5}
+plotNhoodGraphDA(rand.flu.milo, glmm.res, alpha=0.1, layout="UMAP") +
+        guides(size=FALSE, edge_width=FALSE)
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Inf_BatchRandVar_GLMM-NhoodGraph.png",
+       height=3.25, width=4, bg='white', dpi=300)
+```
+
+Enriched nhoods are more abundant in the EUR group, and _vice versa_ for the depleted nhoods. What do these DA cell states represent exactly?
+
+```{r}
+set.seed(42)
+glmm.res <- groupNhoods(rand.flu.milo, glmm.res, da.fdr=0.1, overlap=5, max.lfc.delta=2)
+ngroups <- max(as.numeric(glmm.res$NhoodGroup))
+# glmm.res$NhoodGroup <- ordered(glmm.res$NhoodGroup,
+#                               levels=c(1:ngroups))
+```
+
+
+```{r, message=FALSE, fig.width=11, fig.height=4.5}
+g.cols <- colorRampPalette(pal_d3()(10))(ngroups)
+names(g.cols) <- unique(glmm.res$NhoodGroup)
+
+plotNhoodGroups(rand.flu.milo, glmm.res) +
+    guides(fill=guide_legend(override.aes=list(size=3.5), ncol=2),
+           size=FALSE, edge_width=FALSE) +
+    scale_fill_manual(values=g.cols, breaks=as.numeric(unique(glmm.res$NhoodGroup)))  +
+    guides(fill=guide_legend(title="NhoodGroup", ncol=2, override.aes=list(size=3))) +
+
+plotDAbeeswarm(glmm.res, alpha=0.1, group.by="NhoodGroup") +
+    labs(y="Log fold change", x="Nhood Group") +
+    theme(axis.text=element_text(size=14), axis.title=element_text(size=16)) +
+    NULL
+
+p.graph <- plotNhoodGroups(rand.flu.milo, glmm.res) +
+    guides(fill=guide_legend(override.aes=list(size=3.5), ncol=2),
+           size=FALSE, edge_width=FALSE) +
+    scale_fill_manual(values=g.cols, breaks=as.numeric(unique(glmm.res$NhoodGroup)))  +
+    guides(fill=guide_legend(title="NhoodGroup", ncol=2, override.aes=list(size=3)))
+
+ggsave(p.graph, filename="~/Dropbox/GLMM/plots/Randolph_DANhoodGraph-NhoodGroups.png",
+       height=4.5, width=6.5, bg='white', dpi=300)
+```
+
+This nhood group should allow me to identify the specific Nhoods that are DA and the ones that share cells. I'll then perform DGE testing to identify the marker genes for these 
+cell states compared to all other cells.
+
+Check the direction of effect in DA nhoods.
+
+```{r}
+plotNhoodCounts(rand.flu.milo, subset.nhoods=glmm.res$Nhood[glmm.res$SpatialFDR < 0.01 & glmm.res$NhoodGroup %in% c(1)][1:6], 
+                condition="SOC_genetic_ancestry", design.df=test.meta)
+```
+
+
+```{r}
+group.nhoods.list <- list()
+nhood.groups <- unique(glmm.res$NhoodGroup)
+
+for(x in seq_along(nhood.groups)){
+    x.group <- nhood.groups[x]
+    x.nhoods <- glmm.res$Nhood[glmm.res$NhoodGroup %in% x.group & glmm.res$SpatialFDR < 0.1]
+    x.notda <- glmm.res$Nhood[glmm.res$NhoodGroup %in% x.group & glmm.res$SpatialFDR >= 0.1]
+    x.cells <- colnames(rand.flu.milo)[rowSums(nhoods(rand.flu.milo)[, x.nhoods, drop=FALSE]) > 0]
+    x.notda.cells <- colnames(rand.flu.milo)[rowSums(nhoods(rand.flu.milo)[, x.notda, drop=FALSE]) > 0]
+    
+    if(length(x.cells) > 10 & length(x.notda.cells) > 10){
+    
+        # pseudobulk these cells over samples, and mush all of the other cells together but only within the nhood group?
+        x.meta <- colData(rand.flu.milo)
+        x.meta$CellID <- colnames(rand.flu.milo)
+        x.meta <- x.meta[x.meta$CellID %in% c(x.cells, x.notda.cells), ]
+        
+        x.meta$Grouping <- "Ref"
+        x.meta$Grouping[x.meta$CellID %in% x.cells] <- "Test"
+        x.meta$Sample.Group <- paste0(x.meta$SOC_indiv_ID, "-", x.meta$Grouping)
+        
+        x.psbulk.design <- model.matrix(~ 0 + Sample.Group, data=x.meta)
+        colnames(x.psbulk.design) <- gsub(colnames(x.psbulk.design), pattern="Sample\\.Group", replacement="")
+        n.cells <- colSums(x.psbulk.design)
+    
+        x.agg <- counts(rand.flu.milo[, colnames(rand.flu.milo) %in% x.meta$CellID]) %*% x.psbulk.design
+        colnames(x.agg) <- colnames(x.psbulk.design)
+        rownames(x.agg) <- rownames(rand.flu.milo)
+        
+        x.ps.meta <- data.frame("SOC_indiv_ID"=gsub(colnames(x.agg), pattern="(\\S+)-(\\S+)", replacement="\\1"),
+                                "NCell"=n.cells,
+                                "Group"=gsub(colnames(x.agg), pattern="(\\S+)-(\\S+)", replacement="\\2"))
+        x.ps.meta <- merge(x.ps.meta, test.meta, by='SOC_indiv_ID')
+        
+        ## use edgeR
+        x.agg.mod <- model.matrix(~ Group + NCell, data=x.ps.meta)
+        x.dge <- DGEList(x.agg, lib.size=log(colSums(x.agg)))
+        x.dge <- estimateDisp(x.dge, x.agg.mod)
+        x.fit <- glmQLFit(x.dge, x.agg.mod, robust=TRUE)
+        
+        x.res <- as.data.frame(topTags(glmQLFTest(x.fit, coef=2),
+                                       sort.by='none', n=Inf))
+        x.res$GeneID <- rownames(x.res)
+        x.res$NhoodGroup <- x.group
+        group.nhoods.list[[x.group]] <- x.res
+    }
+}
+
+all.da.markers <- do.call(rbind.data.frame, group.nhoods.list)
+table(all.da.markers$FDR < 0.01, all.da.markers$NhoodGroup)
+```
+
+There are quite a few markers found in each cell state.  What are the top genes in each?
+
+```{r}
+top.mark.list <- list()
+da.groups <- unique(all.da.markers$NhoodGroup)
+all.top <- c()
+
+for(x in seq_along(da.groups)){
+    x.da <- da.groups[x]
+    x.res <- all.da.markers[all.da.markers$NhoodGroup %in% x.da, ]
+    x.res <- x.res[x.res$logFC > 0, ]
+    x.res <- x.res[order(x.res$FDR, decreasing=FALSE), ]
+    x.top <- x.res[c(1:20), ]$GeneID
+    top.mark.list[[x.da]] <- paste(x.top[!is.na(x.top)], collapse=",")
+    all.top <- unique(c(all.top, x.top))
+}
+
+top.genes <- do.call(rbind.data.frame, top.mark.list)
+top.genes <- cbind.data.frame(data.frame("DA.Group"=da.groups), top.genes)
+colnames(top.genes) <- c("DA.Group", "Genes")
+top.genes
+```
+
+Plot the pseudobulked neighbourhood expression across samples with the top marker genes. How do these genes compare to the popDE genes from Randolph _et al_?
+
+```{r}
+# based on the above we have
+# 1 = CD4 IFN response?
+# 2 = CD8 CTLs
+# 3 = CTLs
+# 4 = Mixed B cell states
+# 5 = Naive T cells
+# 6 = Monocytes
+# 7 = 
+# 8 = NK cells
+# 9 = DCs
+```
+
+Compare these to the nhood group markers to help with broader annotation.
+
+```{r, warning=FALSE}
+nhood.markers <- findNhoodGroupMarkers(rand.flu.milo, glmm.res, assay="logcounts", aggregate.samples=TRUE, gene.offset = TRUE, sample_col="SOC_indiv_ID")
+
+nhood.group.top <- list()
+for(x in seq_len(ngroups)){
+    x.markers <- nhood.markers[, c("GeneID", paste0("logFC_", x), paste0("adj.P.Val_", x))]
+    x.top <- x.markers[order(x.markers[, paste0("adj.P.Val_", x)], decreasing=FALSE),]
+    x.top <- x.top[x.top[, paste0("logFC_", x)] > 0, ]
+    x.genes <- x.top[c(1:20), ]$GeneID
+    nhood.group.top[[x]] <- data.frame("NhoodGroup"=x, "Markers"=paste(x.genes, collapse=", "))
+}
+
+nhood.top.df <- do.call(rbind.data.frame, nhood.group.top)
+nhood.top.df
+```
+
+
+```{r}
+# based on the above we have
+# 1 = Naive T cells
+# 2 = Memory T cells
+# 3 = CD8+ T cells
+# 4 = B cells
+# 5 = Naive T cells
+# 6 = Monocytes
+# 7 = IAV-infected cells
+# 8 = NK cells
+# 9 = DCs
+```
+
+Now compare the popDE genes for each cell type to the DA cell state marker genes. 
+
+```{r}
+pop.de.lfsr <- read.table("~/Dropbox/GLMM/docs/Randolph_popDGE_lfsr.txt",
+                          sep="\t", header=TRUE, stringsAsFactors=FALSE)
+# rownames(pop.de.lfsr) <- pop.de.lfsr$genes
+# pop.de.lfsr <- pop.de.lfsr[, -1]
+any.popde <- pop.de.lfsr$genes[colSums(apply(pop.de.lfsr[, -1], 1, FUN=function(GX) GX < 0.1) > 0) > 0] # all popDE genes
+
+celltypes <- colnames(pop.de.lfsr[, -1])
+ct.popde <- sapply(celltypes, FUN=function(CT){
+    pop.de.lfsr$genes[pop.de.lfsr[, CT, drop=FALSE] < 0.1]
+}) # cell type specific DE genes
+```
+
+Loop over the cell state markers, how many are also popDE genes in (a) all popDE genes, and (b) closest matching cell type. I'll only consider the DA cell states/nhood groups. 
+
+Could I try to do some sort of enrichment testing here? We can frame this as 2 questions: (1) Are the popDE genes enriched among the DA cell state markers? or (2) Are the DA cell state 
+markers enriched among the popDE genes? If both questions are yes then we are capturing the same phenomenon, if one is no, then we are capturing complimentary information!
+
+```{r, warning=FALSE, fig.height=3.5, fig.width=8}
+ct.match.list <- list("monocytes_flu"=c("6", "9"), "CD8T_flu"=c("3", "5"), "CD4T_flu"=c("1", "2"), "NK_flu"=c("8"), "B_flu"=c("4"))
+ct.dge.list <- list() # collect the intersecting gene list
+ct.prop.list <- list() # collect the proportions
+
+for(i in seq_along(names(ct.match.list))){
+    i.name <- names(ct.match.list)[i]
+    i.popde <- ct.popde[[i.name]]
+    i.states <- ct.match.list[[i.name]]
+    
+    i.state.list <- list()
+    i.state.props <- list()
+    for(j in seq_along(i.states)){
+        j.dge <- all.da.markers[all.da.markers$NhoodGroup %in% i.states[j] & all.da.markers$FDR < 0.01, ]
+        j.dge <- j.dge[order(j.dge$FDR, decreasing=FALSE), ]
+        j.dge <- j.dge[j.dge$logFC > 0, ]
+        i.state.list[[paste0(i.states[j])]] <- intersect(j.dge$GeneID, i.popde) # intersect with popDEGs
+        
+        # run a binomial test for enrichment of genes in one category compared to the other. Assume 50% randomly distributed
+        i.allgenes <- union(j.dge$GeneID, i.popde)
+        a.bino <- binom.test(x=length(intersect(j.dge$GeneID, i.popde)),
+                             n=length(i.popde),
+                             p=0.5,
+                             alternative="greater")
+        
+        i.prop <- data.frame("Prop.popDE"=length(intersect(j.dge$GeneID, i.popde))/length(i.popde),
+                             "Prop.state"=length(intersect(j.dge$GeneID, i.popde))/length(j.dge$GeneID),
+                             "Binom.P"=a.bino$p.value,
+                             "N.popDE"=length(i.popde), "N.state"=length(j.dge$GeneID))
+        i.prop$State <- i.states[j]
+        i.prop$CellType <- i.name
+        
+        i.state.props[[paste0(i.states[j])]] <- i.prop # what proportion of the ct popDE and state markers are these?
+    }
+    
+    ct.dge.list[[i.name]] <- i.state.list
+    ct.prop.list[[i.name]] <- do.call(rbind.data.frame, i.state.props)
+}
+
+prop.dge.df <- do.call(rbind.data.frame, ct.prop.list)
+prop.dge.df$State <- as.character(prop.dge.df$State)
+prop.dge.df$CellType <- gsub(prop.dge.df$CellType, pattern="(\\S+)_(flu)", replacement="\\1")
+
+ggplot(prop.dge.df, aes(x=CellType, y=Prop.popDE, fill=State)) +
+    geom_bar(stat='identity', position="dodge") +
+    geom_text_repel(aes(label=N.popDE, group=State),
+                    min.segment.length = unit(0, 'lines'),
+                    position=position_dodge()) +
+    theme_cowplot() +
+    scale_fill_manual(values=g.cols) +
+    theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+    labs(x="Cell type", y="Prop. pop DEGs") +
+    
+ggplot(prop.dge.df, aes(x=CellType, y=Prop.state, fill=State)) +
+    geom_bar(stat='identity', position="dodge") +
+    geom_text_repel(aes(label=N.state, group=State),
+                    min.segment.length = unit(0, 'lines'),
+                    position=position_dodge()) +
+    theme_cowplot() +
+    scale_fill_manual(values=g.cols) +
+    theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+    labs(x="Cell type", y="Prop. cell state\nmarkers") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_popDGE-vs-DAmarkers.png",
+       height=3.5, width=8, bg='white', dpi=300)
+```
+
+These plots show the proportion of the population DEGs (left) and cell state markers (right) that are explained by the respective gene set. Here we can see that ~80% of flu-infected monocyte 
+popDEGs are explained by the cell state markers for population 6, but that only 10% of the corresponding cell state markers are explained by the pop DEGs. Does this indicate that there 
+is higher resolution cell states that actually differ between EUR and AFR populations? 
+
+Visualise the DA cell state markers across nhoods.
+
+```{r}
+glmm.res <- annotateNhoods(rand.flu.milo, glmm.res, "ident")
+da.nhood.meta <- data.frame("Nhood"=colnames(nhoodExpression(rand.flu.milo)[, !glmm.res$NhoodGroup %in% c(11, 12, 13), drop=FALSE]),
+                            "NhoodGroup"=glmm.res$NhoodGroup[!glmm.res$NhoodGroup %in% c(11, 12, 13)],
+                            "LFC"=glmm.res$logFC[!glmm.res$NhoodGroup %in% c(11, 12, 13)],
+                            "Celltype"=glmm.res$ident[!glmm.res$NhoodGroup %in% c(11, 12, 13)])
+da.nhood.meta$NhoodGroup <- factor(da.nhood.meta$NhoodGroup,
+                                      levels=c(1:ngroups))
+rownames(da.nhood.meta) <- da.nhood.meta$Nhood
+```
+
+I'll make heatmap of marker genes to loosely annotate the clusters.
+
+```{r}
+top.mark.list <- list()
+da.groups <- unique(all.da.markers$NhoodGroup)
+all.top <- c()
+
+for(x in seq_along(da.groups)){
+    x.da <- da.groups[x]
+    x.res <- all.da.markers[all.da.markers$NhoodGroup %in% x.da, ]
+    x.res <- x.res[x.res$logFC > 0, ]
+    x.res <- x.res[order(x.res$FDR, decreasing=FALSE), ]
+    x.top <- x.res[c(1:3), ]$GeneID
+    top.mark.list[[x.da]] <- paste(x.top[!is.na(x.top)], collapse=",")
+    all.top <- unique(c(all.top, x.top))
+}
+
+top.genes <- do.call(rbind.data.frame, top.mark.list)
+top.genes <- cbind.data.frame(data.frame("DA.Group"=da.groups), top.genes)
+colnames(top.genes) <- c("DA.Group", "Genes")
+top.genes
+```
+
+
+```{r, warning=FALSE, message=FALSE, fig.height=7, fig.width=10}
+ht_opt$message = FALSE
+cs.genes <- unique(unlist(strsplit(top.genes$Genes, split=",", fixed=TRUE)))
+
+# highlight a couple of marker genes
+marker.genes <- c("CD3E", "CD4", "CD8A", "CD14", "FCGR3A", "NCAM1", "MS4A1", "CD19", "CTLA4", "CD44", "FOXP3")
+hm.exprs <- nhoodExpression(rand.flu.milo)[rownames(nhoodExpression(rand.flu.milo)[, !glmm.res$NhoodGroup %in% c(11, 12, 13)]) %in% unique(c(cs.genes, marker.genes)), ]
+# rownames(hm.exprs) <- gene.df[rownames(hm.exprs), ]$external_gene_name
+hm.exprs <- hm.exprs[!rownames(hm.exprs) == "", ]
+hm.exprs <- hm.exprs[!is.na(rownames(hm.exprs)), ]
+
+# drop anything with ~0 expression
+hm.exprs <- t(scale(t(hm.exprs), center=TRUE, scale=TRUE))
+# use 90th quantiles
+hm.quants <- quantile(hm.exprs, c(0.001, 0.999))
+hm.cols <- circlize::colorRamp2(c(min(hm.exprs), 0, max(hm.quants)), colors=c("darkblue", "white", "darkorange"))
+
+da.nhood.meta <- da.nhood.meta[colnames(hm.exprs), ]
+
+annot.df <- data.frame("NhoodGroup"=da.nhood.meta$NhoodGroup,
+                       "Cell.types"=da.nhood.meta$Celltype,
+                       "LFC"=da.nhood.meta$LFC)
+rownames(annot.df) <- rownames(da.nhood.meta)
+
+col.breaks <- as.character(annot.df$NhoodGroup)
+lfc.cols <- circlize::colorRamp2(c(-2, 0, 2), colors=c("red", "white", "blue"))
+
+# Set stylings for row names and make our selected rows unique
+row_idx <- which(rownames(hm.exprs) %in% marker.genes)
+fontcolors <- rep('black', nrow(hm.exprs))
+fontcolors[row_idx] <- 'coral2'
+rowAnno <- rowAnnotation(rows = anno_text(rownames(hm.exprs), 
+                                          gp = gpar(col = fontcolors)))
+
+
+col.annot <- HeatmapAnnotation(df=annot.df,
+                               col=list("NhoodGroup"=g.cols[c(1:10)],
+                                        "Cell.types"=ct_cols,
+                                        "LFC"=lfc.cols
+                                        ),
+                               gp=gpar(fontsize=14),
+                               annotation_name_gp = gpar(fontsize=14),
+                               annotation_legend_param=list("Cell.types"=list(direction="vertical", ncol=1),
+                                                            "LFC"=list(direction="vertical", ncol=1),
+                                                            labels_gp=gpar(fontsize=14),
+                                                            title_gp=gpar(fontsize=14)))
+png("~/Dropbox/GLMM/plots/Randolph_DANhoodTcell_markers-heatmap.png",
+    height=7, width=10, units="in", res=300)
+Heatmap(hm.exprs, col=hm.cols, name="Z-score",
+        column_split=col.breaks, jitter=FALSE,
+        use_raster=TRUE, cluster_rows=TRUE,
+        cluster_columns = FALSE, show_column_names=FALSE,
+        show_row_names = FALSE,
+        column_title=NULL,
+        row_names_gp=gpar(fontsize=14),
+        column_title_gp=gpar(fontsize=14),
+        heatmap_legend_param = list(direction = "vertical", ncol=1,
+                                    title_gp=gpar(fontsize=14), labels_gp=gpar(fontsize=14)),
+        column_gap=unit(0.75, "mm"),
+        top_annotation=col.annot,
+        right_annotation = rowAnno)
+dev.off()
+
+Heatmap(hm.exprs, col=hm.cols, name="Z-score",
+        column_split=col.breaks, jitter=FALSE,
+        use_raster=TRUE, cluster_rows=TRUE,
+        cluster_columns = FALSE, show_column_names=FALSE,
+        show_row_names = FALSE,
+        column_title=NULL,
+        row_names_gp=gpar(fontsize=14),
+        column_title_gp=gpar(fontsize=14),
+        heatmap_legend_param = list(direction = "vertical", ncol=1,
+                                    title_gp=gpar(fontsize=14), labels_gp=gpar(fontsize=14)),
+        column_gap=unit(0.75, "mm"),
+        top_annotation=col.annot,
+        right_annotation = rowAnno)
+```
+
+
+
+```{r}
+# save the DA results for comparison with GWAS results
+write.table(glmm.res, file="~/Dropbox/GLMM/results/Randolph_FluGLMM_results.tsv",
+            quote=FALSE, sep="\t", row.names=FALSE)
+```
+
+
+# Mock-infected PBMCs
+
+What differences do we see in the resting/mock-infected PBMCs?
+
+```{r}
+rand.ni.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_Milo.RDS")
+rand.ni.meta <- as.data.frame(colData(rand.ni.milo))
+rand.ni.meta$CellID <- colnames(rand.ni.milo)
+rand.ni.fr <- as.data.frame(reducedDim(rand.ni.milo, "UMAP"))
+rand.ni.fr$CellID <- colnames(rand.ni.milo)
+
+rand.ni.meta <- merge(rand.ni.meta, rand.ni.fr, by="CellID")
+```
+
+
+```{r}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+ggplot(rand.ni.meta, aes(x=UMAP1, y=UMAP2, colour=ident)) +
+    geom_scattermore(pointsize=0.75) +
+    scale_colour_manual(values=ct_cols) +
+    theme_cowplot() +
+    guides(colour=guide_legend(title="Cell type", override.aes = list(size=3.5, shape=15))) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Mock_cellTypes-UMAP.png",
+       height=3.2, width=5, dpi=300, bg='white')
+```
+
+
+```{r, fig.heigh=4.5, fig.width=9}
+ggplot(rand.ni.meta, aes(x=UMAP1, y=UMAP2)) +
+    geom_scattermore(data=rand.ni.meta[, c("UMAP1", "UMAP2")],
+                     pointsize=0.5, colour='grey80') +
+    geom_scattermore(aes(colour=SOC_infection_status), pointsize=0.75) +
+    scale_colour_d3() +
+    facet_wrap(~SOC_infection_status) +
+    theme_cowplot()
+```
+
+We should inspect the mean-variance relationship in the nhoods counts matrix.
+
+```{r}
+mu.var.df <- data.frame("Mean"=rowMeans2(nhoodCounts(rand.ni.milo)),
+                        "Var"=rowVars(nhoodCounts(rand.ni.milo)))
+
+ggplot(mu.var.df, aes(x=Mean, y=Var)) +
+    geom_point() +
+    geom_smooth() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    NULL
+```
+
+The red line denotes the x=y, i.e. Poisson expected variance line. Clearly there is overdispersion so an overdispersed model is appropriate. The blue line is the best fit GAM using 
+a cubic spline with shrinkage. This probably isn't too far off the dispersion estimation used by edgeR.
+
+```{r}
+ggplot(mu.var.df, aes(x=Mean, y=Var)) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    geom_smooth() +
+    theme_cowplot() +
+    scale_y_log10() +
+    scale_x_log10() +
+    NULL
+```
+
+This is the same plot as above, on a log scale.
+
+```{r}
+plotNhoodSizeHist(rand.ni.milo)
+```
+
+## DA testing with batch adjustment
+
+```{r}
+test.meta <- rand.ni.meta[rand.ni.meta$SOC_infection_status %in% c("NI"), 
+                        c("orig.ident", "batchID", "SOC_indiv_ID", "SOC_infection_status", "SOC_genetic_ancestry",
+                          "CEU", "YRI", "sample_condition", "ident", "CellID") ]
+test.meta <- test.meta[!duplicated(test.meta$sample_condition), ]
+rownames(test.meta) <- test.meta$SOC_indiv_ID
+table(test.meta$batchID)
+```
+
+Setup the design matrix and test nhoods. Should this just be on a few hundred nhoods for the sake of speed?
+
+```{r, warning=FALSE}
+glmm.res <- testNhoods(rand.ni.milo, design.df=test.meta, 
+                       design= ~ SOC_genetic_ancestry + (1|batchID), reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param)
+table(glmm.res$SpatialFDR < 0.1)
+head(glmm.res)
+```
+
+Plot the results in an MA plot to check for sanity. We want to see LFC values distributed around 0.
+
+```{r, fig.height=4, fig.width=6.5}
+ggplot(glmm.res, aes(x=logCPM, y=logFC, colour=SpatialFDR < 0.1)) +
+    geom_point() +
+    theme_cowplot() +
+    scale_colour_manual(values=c("black", "red")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_Mock_batchRandVar-MAplot.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+
+```{r, warning=FALSE}
+set.seed(42)
+
+glm.res <- testNhoods(rand.ni.milo, design.df=test.meta, 
+                       design= ~ batchID + SOC_genetic_ancestry, reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param)
+table(glm.res$SpatialFDR < 0.1)
+head(glm.res)
+```
+
+
+```{r}
+ggplot(glm.res, aes(x=logCPM, y=logFC, colour=SpatialFDR < 0.1)) +
+    geom_point() +
+    theme_cowplot() +
+    scale_colour_manual(values=c("black", "red")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_Mock_batchFixedVar-MAplot.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+Compare the results between the GLM and GLMM.
+
+```{r}
+plotNhoodGraphDA(rand.ni.milo, milo_res=glm.res) +
+        guides(size=FALSE, edge_width=FALSE)
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Mock_BatchFixedVar_GLM-NhoodGraph.png",
+       height=3.25, width=4, bg='white', dpi=300)
+```
+
+
+```{r}
+glm.glmm.comp <- merge(glm.res, glmm.res, by=c("Nhood"))
+glm.glmm.comp$Sig <- "None"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "Both"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y >= 0.1] <- "GLM"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x >= 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "GLMM"
+
+ggplot(glm.glmm.comp, aes(x=logFC.x, y=logFC.y, colour=Sig)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x="GLM LFC", y="GLMM LFC") +
+    guides(colour=guide_legend(title="DA (FDR 10%)", override.aes=list(size=3.5))) +
+    scale_colour_manual(values=c("red", "orange", "purple", "grey")) +
+    labs(x="GLM Log fold change", y="GLMM log fold change") +
+    theme(axis.text=element_text(size=14), axis.title=element_text(size=16)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Mock_GLMvsGLMM_LFC.png",
+       height=4, width=5, bg='white', dpi=300)
+```
+
+These results are extremely concordant - brilliant! This also shows that we have more power to identify DA nhoods with the GLMM (assuming these aren't just false discoveries). I'll 
+compare the GLMM DA results to the annotated clusters. Perhaps as expected there are many fewer differences in the mock-infected cells between the AFR and EUR ancestry-similar 
+donor cells.
+
+```{r, fig.height=3.25, fig.width=4}
+glmm.res <- annotateNhoods(rand.ni.milo, glmm.res, "ident")
+
+plotDAbeeswarm(glmm.res, alpha=0.1, group.by="ident") +
+    labs(y="Log fold change", x="Cell type") +
+    theme(axis.text=element_text(size=14), axis.title=element_text(size=16)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Mock_CellTypes-beeswarm.png",
+       height=3.25, width=4, dpi=300, bg='white')
+```
+
+These results suggest that individuals classified as AFR ancestry have marginally more monocytes and slightly fewer CD8+ T cells compared to individuals 
+classified as EUR ancestry. This may in part explain some of the differences in the infected cells.
+
+```{r, fig.height=3.25, fig.width=5}
+plotNhoodGraphDA(rand.ni.milo, glmm.res, alpha=0.1, layout="UMAP") +
+    guides(size=FALSE, edge_width=FALSE)
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Mock_nhoodGraph-LFC.png",
+       height=3.25, width=4, dpi=300, bg='white')
+```
+
+```{r}
+set.seed(42)
+glmm.res <- annotateNhoods(rand.ni.milo, glmm.res, "ident")
+glmm.res <- groupNhoods(rand.ni.milo, glmm.res, da.fdr=0.1, overlap=5, max.lfc.delta=2)
+ngroups <- max(as.numeric(glmm.res$NhoodGroup))
+
+# save the DA results for comparison with GWAS results
+write.table(glmm.res, file="~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+            quote=FALSE, sep="\t", row.names=FALSE)
+```
+
+
+
+```{r, message=FALSE, fig.width=11, fig.height=4.5}
+g.cols <- colorRampPalette(pal_d3()(10))(ngroups)
+names(g.cols) <- unique(glmm.res$NhoodGroup)
+
+plotNhoodGroups(rand.ni.milo, glmm.res) +
+    guides(fill=guide_legend(override.aes=list(size=3.5), ncol=2),
+           size=FALSE, edge_width=FALSE) +
+    scale_fill_manual(values=g.cols, breaks=as.numeric(unique(glmm.res$NhoodGroup)))  +
+    guides(fill=guide_legend(title="Nhood State", ncol=2, override.aes=list(size=4))) +
+
+plotDAbeeswarm(glmm.res, alpha=0.1, group.by="NhoodGroup") +
+    labs(y="Log fold change", x="Nhood State") +
+    theme(axis.text=element_text(size=14), axis.title=element_text(size=16)) +
+    NULL
+
+p.graph <- plotNhoodGroups(rand.ni.milo, glmm.res) +
+    guides(fill=guide_legend(override.aes=list(size=3.5), ncol=2),
+           size=FALSE, edge_width=FALSE) +
+    scale_fill_manual(values=g.cols, breaks=as.numeric(unique(glmm.res$NhoodGroup)))  +
+    guides(fill=guide_legend(title="Nhood State", ncol=2, override.aes=list(size=3)))
+
+ggsave(p.graph, filename="~/Dropbox/GLMM/plots/Randolph_mockInf_DANhoodGraph-NhoodGroups.png",
+       height=4.5, width=6.5, bg='white', dpi=300)
+```
+
+This nhood group should allow me to identify the specific Nhoods that are DA and the ones that share cells. I'll then perform DGE testing to identify the marker genes for these 
+cell states compared to all other cells.
+
+Check the direction of effect in DA nhoods.
+
+```{r}
+plotNhoodCounts(rand.ni.milo, subset.nhoods=glmm.res$Nhood[glmm.res$SpatialFDR < 0.01 & glmm.res$NhoodGroup %in% c(3)][1:6], 
+                condition="SOC_genetic_ancestry", design.df=test.meta)
+```
+
+
+```{r}
+group.nhoods.list <- list()
+nhood.groups <- unique(glmm.res$NhoodGroup)
+
+for(x in seq_along(nhood.groups)){
+    x.group <- nhood.groups[x]
+    x.nhoods <- glmm.res$Nhood[glmm.res$NhoodGroup %in% x.group & glmm.res$SpatialFDR < 0.1]
+    x.notda <- glmm.res$Nhood[glmm.res$NhoodGroup %in% x.group & glmm.res$SpatialFDR >= 0.1]
+    x.cells <- colnames(rand.ni.milo)[rowSums(nhoods(rand.ni.milo)[, x.nhoods, drop=FALSE]) > 0]
+    x.notda.cells <- colnames(rand.ni.milo)[rowSums(nhoods(rand.ni.milo)[, x.notda, drop=FALSE]) > 0]
+    
+    if(length(x.cells) > 10 & length(x.notda.cells) > 10){
+    
+        # pseudobulk these cells over samples, and mush all of the other cells together but only within the nhood group?
+        x.meta <- colData(rand.ni.milo)
+        x.meta$CellID <- colnames(rand.ni.milo)
+        x.meta <- x.meta[x.meta$CellID %in% c(x.cells, x.notda.cells), ]
+        
+        x.meta$Grouping <- "Ref"
+        x.meta$Grouping[x.meta$CellID %in% x.cells] <- "Test"
+        x.meta$Sample.Group <- paste0(x.meta$SOC_indiv_ID, "-", x.meta$Grouping)
+        
+        x.psbulk.design <- model.matrix(~ 0 + Sample.Group, data=x.meta)
+        colnames(x.psbulk.design) <- gsub(colnames(x.psbulk.design), pattern="Sample\\.Group", replacement="")
+        n.cells <- colSums(x.psbulk.design)
+    
+        x.agg <- counts(rand.ni.milo[, colnames(rand.ni.milo) %in% x.meta$CellID]) %*% x.psbulk.design
+        colnames(x.agg) <- colnames(x.psbulk.design)
+        rownames(x.agg) <- rownames(rand.ni.milo)
+        
+        x.ps.meta <- data.frame("SOC_indiv_ID"=gsub(colnames(x.agg), pattern="(\\S+)-(\\S+)", replacement="\\1"),
+                                "NCell"=n.cells,
+                                "Group"=gsub(colnames(x.agg), pattern="(\\S+)-(\\S+)", replacement="\\2"))
+        x.ps.meta <- merge(x.ps.meta, test.meta, by='SOC_indiv_ID')
+        
+        ## use edgeR
+        x.agg.mod <- model.matrix(~ Group + NCell, data=x.ps.meta)
+        x.dge <- DGEList(x.agg, lib.size=log(colSums(x.agg)))
+        x.dge <- estimateDisp(x.dge, x.agg.mod)
+        x.fit <- glmQLFit(x.dge, x.agg.mod, robust=TRUE)
+        
+        x.res <- as.data.frame(topTags(glmQLFTest(x.fit, coef=2),
+                                       sort.by='none', n=Inf))
+        x.res$GeneID <- rownames(x.res)
+        x.res$NhoodGroup <- x.group
+        group.nhoods.list[[x.group]] <- x.res
+    }
+}
+
+all.da.markers <- do.call(rbind.data.frame, group.nhoods.list)
+table(all.da.markers$FDR < 0.01, all.da.markers$NhoodGroup)
+```
+
+There are quite a few markers found in each cell state.  What are the top genes in each?
+
+```{r}
+top.mark.list <- list()
+da.groups <- unique(all.da.markers$NhoodGroup)
+all.top <- c()
+
+for(x in seq_along(da.groups)){
+    x.da <- da.groups[x]
+    x.res <- all.da.markers[all.da.markers$NhoodGroup %in% x.da, ]
+    x.res <- x.res[x.res$logFC > 0, ]
+    x.res <- x.res[order(x.res$FDR, decreasing=FALSE), ]
+    x.top <- x.res[c(1:20), ]$GeneID
+    top.mark.list[[x.da]] <- paste(x.top[!is.na(x.top)], collapse=",")
+    all.top <- unique(c(all.top, x.top))
+}
+
+top.genes <- do.call(rbind.data.frame, top.mark.list)
+top.genes <- cbind.data.frame(data.frame("DA.Group"=da.groups), top.genes)
+colnames(top.genes) <- c("DA.Group", "Genes")
+top.genes
+```
+
+Plot the pseudobulked neighbourhood expression across samples with the top marker genes. How do these genes compare to the popDE genes from Randolph _et al_?
+
+```{r}
+# based on the above we have
+# 1 = CD8+ T ceels
+# 2 = CD4+ T cells? (AIRE??)
+# 3 = Monocytes
+# 4 = B cells
+# 5 = CD4+ T cells
+# 6 = CD4+ T cells
+# 7 = 
+# 8 = NK cells
+# 9 = B cells
+```
+
+Compare these to the nhood group markers to help with broader annotation.
+
+```{r, warning=FALSE}
+nhood.markers <- findNhoodGroupMarkers(rand.ni.milo, glmm.res, assay="logcounts", aggregate.samples=TRUE, gene.offset = TRUE, sample_col="SOC_indiv_ID")
+
+nhood.group.top <- list()
+for(x in seq_len(ngroups)){
+    x.markers <- nhood.markers[, c("GeneID", paste0("logFC_", x), paste0("adj.P.Val_", x))]
+    x.top <- x.markers[order(x.markers[, paste0("adj.P.Val_", x)], decreasing=FALSE),]
+    x.top <- x.top[x.top[, paste0("logFC_", x)] > 0, ]
+    x.genes <- x.top[c(1:20), ]$GeneID
+    nhood.group.top[[x]] <- data.frame("NhoodGroup"=x, "Markers"=paste(x.genes, collapse=", "))
+}
+
+nhood.top.df <- do.call(rbind.data.frame, nhood.group.top)
+nhood.top.df
+```
+
+
+
+```{r}
+# based on the above we have
+# 1 = Memory T cells
+# 2 = Naive T cells
+# 3 = Monocytes
+# 4 = B cells
+# 5 = Naive T cells
+# 6 = Memory T cells
+# 7 = Cd69+ T cels
+# 8 = NK cells
+# 9 = B cels
+# 10 = DCs?
+```
+
+Now compare the popDE genes for each cell type to the DA cell state marker genes. 
+
+```{r}
+pop.de.lfsr <- read.table("~/Dropbox/GLMM/docs/Randolph_popDGE_lfsr.txt",
+                          sep="\t", header=TRUE, stringsAsFactors=FALSE)
+# rownames(pop.de.lfsr) <- pop.de.lfsr$genes
+# pop.de.lfsr <- pop.de.lfsr[, -1]
+any.popde <- pop.de.lfsr$genes[colSums(apply(pop.de.lfsr[, -1], 1, FUN=function(GX) GX < 0.1) > 0) > 0] # all popDE genes
+
+celltypes <- colnames(pop.de.lfsr[, -1])
+ct.popde <- sapply(celltypes, FUN=function(CT){
+    pop.de.lfsr$genes[pop.de.lfsr[, CT, drop=FALSE] < 0.1]
+}) # cell type specific DE genes
+```
+
+Loop over the cell state markers, how many are also popDE genes in (a) all popDE genes, and (b) closest matching cell type. I'll only consider the DA cell states/nhood groups. 
+
+Could I try to do some sort of enrichment testing here? We can frame this as 2 questions: (1) Are the popDE genes enriched among the DA cell state markers? or (2) Are the DA cell state 
+markers enriched among the popDE genes? If both questions are yes then we are capturing the same phenomenon, if one is no, then we are capturing complimentary information!
+
+```{r, warning=FALSE, fig.height=7, fig.width=4}
+ct.match.list <- list("monocytes_NI"=c("3", "10"), "CD8T_NI"=c("1"), "CD4T_NI"=c("2", "5", "6", "7"), "NK_NI"=c("8"), "B_NI"=c("4", "9"))
+ct.dge.list <- list() # collect the intersecting gene list
+ct.prop.list <- list() # collect the proportions
+
+for(i in seq_along(names(ct.match.list))){
+    i.name <- names(ct.match.list)[i]
+    i.popde <- ct.popde[[i.name]]
+    i.states <- ct.match.list[[i.name]]
+    
+    i.state.list <- list()
+    i.state.props <- list()
+    for(j in seq_along(i.states)){
+        j.dge <- all.da.markers[all.da.markers$NhoodGroup %in% i.states[j] & all.da.markers$FDR < 0.01, ]
+        j.dge <- j.dge[order(j.dge$FDR, decreasing=FALSE), ]
+        j.dge <- j.dge[j.dge$logFC > 0, ]
+        i.state.list[[paste0(i.states[j])]] <- intersect(j.dge$GeneID, i.popde) # intersect with popDEGs
+        
+        # run a binomial test for enrichment of genes in one category compared to the other. Assume 50% randomly distributed
+        i.allgenes <- union(j.dge$GeneID, i.popde)
+        a.bino <- binom.test(x=length(intersect(j.dge$GeneID, i.popde)),
+                             n=length(i.popde),
+                             p=0.5,
+                             alternative="greater")
+        
+        i.prop <- data.frame("Prop.popDE"=length(intersect(j.dge$GeneID, i.popde))/length(i.popde),
+                             "Prop.state"=length(intersect(j.dge$GeneID, i.popde))/length(j.dge$GeneID),
+                             "Binom.P"=a.bino$p.value,
+                             "N.popDE"=length(i.popde), "N.state"=length(j.dge$GeneID))
+        i.prop$State <- i.states[j]
+        i.prop$CellType <- i.name
+        
+        i.state.props[[paste0(i.states[j])]] <- i.prop # what proportion of the ct popDE and state markers are these?
+    }
+    
+    ct.dge.list[[i.name]] <- i.state.list
+    ct.prop.list[[i.name]] <- do.call(rbind.data.frame, i.state.props)
+}
+
+prop.dge.df <- do.call(rbind.data.frame, ct.prop.list)
+prop.dge.df$State <- as.character(prop.dge.df$State)
+prop.dge.df$CellType <- gsub(prop.dge.df$CellType, pattern="(\\S+)_(NI)", replacement="\\1")
+prop.dge.df$State <- factor(prop.dge.df$State,
+                            levels=c(1:10))
+
+prop.dge.df$N.popDE[duplicated(prop.dge.df$N.popDE)] <- NA
+
+p.dge <- ggplot(prop.dge.df, aes(x=CellType, y=Prop.popDE, fill=State)) +
+    geom_bar(stat='identity', position="dodge") +
+    geom_text_repel(aes(label=N.popDE, group=State),
+                    min.segment.length = unit(0, 'lines'),
+                    position=position_dodge()) +
+    theme_cowplot() +
+    scale_fill_manual(values=g.cols) +
+    labs(x="Cell type", y="Prop. pop DEGs") +
+  theme(#axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        axis.title.x=element_blank(), axis.text.x=element_blank()) +
+  guides(fill=guide_legend(title="Nhood\nState")) +
+  NULL
+    
+p.da <- ggplot(prop.dge.df, aes(x=CellType, y=Prop.state, fill=State)) +
+    geom_bar(stat='identity', position="dodge") +
+    geom_text_repel(aes(label=N.state, group=State),
+                    min.segment.length = unit(0, 'lines'),
+                    position=position_dodge()) +
+    theme_cowplot() +
+    scale_fill_manual(values=g.cols) +
+    theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+    labs(x="Cell type", y="Prop. cell state\nmarkers") +
+  guides(fill=guide_legend(title="Nhood State")) +
+    NULL
+
+# extract the legend from one of the plots
+p.legend <- get_legend(
+  # create some space to the left of the legend
+  p.dge + theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+
+
+p.comb <- plot_grid(p.dge + theme(legend.position="none"),
+                    p.da + theme(legend.position="none"),
+                    ncol=1, rel_heights = c(0.8, 1),
+                    align="v")
+
+plot_grid(p.comb, p.legend, rel_widths = c(3, .75))
+
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_popDGE-vs-MockInf_DAmarkers.png",
+       height=7, width=4, bg='white', dpi=300)
+```
+
+These plots show the proportion of the population DEGs (left) and cell state markers (right) that are explained by the respective gene set. The overlaps are vanishingly smale, 0 in most case. 
+This supports the notion that popDA cell states are distinct from the popDE genes identified at the cell type level.
+
+Visualise the DA cell state markers across nhoods.
+
+```{r}
+glmm.res <- annotateNhoods(rand.ni.milo, glmm.res, "ident")
+da.nhood.meta <- data.frame("Nhood"=colnames(nhoodExpression(rand.ni.milo)[, !glmm.res$NhoodGroup %in% c(11:16), drop=FALSE]),
+                            "NhoodGroup"=glmm.res$NhoodGroup[!glmm.res$NhoodGroup %in% c(11:16)],
+                            "LFC"=glmm.res$logFC[!glmm.res$NhoodGroup %in% c(11:16)],
+                            "Celltype"=glmm.res$ident[!glmm.res$NhoodGroup %in% c(11:16)])
+da.nhood.meta$NhoodGroup <- factor(da.nhood.meta$NhoodGroup,
+                                      levels=c(1:ngroups))
+rownames(da.nhood.meta) <- da.nhood.meta$Nhood
+```
+
+I'll make heatmap of marker genes to loosely annotate the clusters.
+
+```{r}
+top.mark.list <- list()
+da.groups <- unique(all.da.markers$NhoodGroup)
+all.top <- c()
+
+for(x in seq_along(da.groups)){
+    x.da <- da.groups[x]
+    x.res <- all.da.markers[all.da.markers$NhoodGroup %in% x.da, ]
+    x.res <- x.res[x.res$logFC > 0, ]
+    x.res <- x.res[order(x.res$FDR, decreasing=FALSE), ]
+    x.top <- x.res[c(1:3), ]$GeneID
+    top.mark.list[[x.da]] <- paste(x.top[!is.na(x.top)], collapse=",")
+    all.top <- unique(c(all.top, x.top))
+}
+
+top.genes <- do.call(rbind.data.frame, top.mark.list)
+top.genes <- cbind.data.frame(data.frame("DA.Group"=da.groups), top.genes)
+colnames(top.genes) <- c("DA.Group", "Genes")
+top.genes
+```
+
+
+```{r, warning=FALSE, message=FALSE, fig.height=7, fig.width=10}
+ht_opt$message = FALSE
+cs.genes <- unique(unlist(strsplit(top.genes$Genes, split=",", fixed=TRUE)))
+
+# highlight a couple of marker genes
+marker.genes <- c("CD3E", "CD4", "CD8A", "CD14", "FCGR3A", "NCAM1", "MS4A1", "CD19")
+hm.exprs <- nhoodExpression(rand.ni.milo)[rownames(nhoodExpression(rand.ni.milo)[, !glmm.res$NhoodGroup %in% c(11:16)]) %in% unique(c(cs.genes, marker.genes)), ]
+# rownames(hm.exprs) <- gene.df[rownames(hm.exprs), ]$external_gene_name
+hm.exprs <- hm.exprs[!rownames(hm.exprs) == "", ]
+hm.exprs <- hm.exprs[!is.na(rownames(hm.exprs)), ]
+
+# drop anything with ~0 expression
+hm.exprs <- t(scale(t(hm.exprs), center=TRUE, scale=TRUE))
+# use 90th quantiles
+hm.quants <- quantile(hm.exprs, c(0.001, 0.999))
+hm.cols <- circlize::colorRamp2(c(min(hm.exprs), 0, max(hm.quants)), colors=c("darkblue", "white", "darkorange"))
+
+da.nhood.meta <- da.nhood.meta[colnames(hm.exprs), ]
+
+annot.df <- data.frame("Nhood.State"=da.nhood.meta$NhoodGroup,
+                       "Cell.types"=da.nhood.meta$Celltype,
+                       "LFC"=da.nhood.meta$LFC)
+rownames(annot.df) <- rownames(da.nhood.meta)
+
+col.breaks <- as.character(annot.df$Nhood.State)
+lfc.cols <- circlize::colorRamp2(c(-2, 0, 2), colors=c("red", "white", "blue"))
+
+# Set stylings for row names and make our selected rows unique
+row_idx <- which(rownames(hm.exprs) %in% marker.genes)
+fontcolors <- rep('black', nrow(hm.exprs))
+fontcolors[row_idx] <- 'coral2'
+rowAnno <- rowAnnotation(rows = anno_text(rownames(hm.exprs), 
+                                          gp = gpar(col = fontcolors)))
+
+
+col.annot <- HeatmapAnnotation(df=annot.df,
+                               col=list("Nhood.State"=g.cols[c(1:10)],
+                                        "Cell.types"=ct_cols,
+                                        "LFC"=lfc.cols
+                                        ),
+                               gp=gpar(fontsize=14),
+                               annotation_name_gp = gpar(fontsize=14),
+                               annotation_legend_param=list("Cell.types"=list(direction="vertical", ncol=1),
+                                                            "LFC"=list(direction="vertical", ncol=1),
+                                                            labels_gp=gpar(fontsize=14),
+                                                            title_gp=gpar(fontsize=14)))
+png("~/Dropbox/GLMM/plots/Randolph-MockInfected_DANhoodTcell_markers-heatmap.png",
+    height=7, width=10, units="in", res=300)
+Heatmap(hm.exprs, col=hm.cols, name="Z-score",
+        column_split=col.breaks, jitter=FALSE,
+        use_raster=TRUE, cluster_rows=TRUE,
+        cluster_columns = FALSE, show_column_names=FALSE,
+        show_row_names = FALSE,
+        column_title=NULL,
+        row_names_gp=gpar(fontsize=14),
+        column_title_gp=gpar(fontsize=14),
+        heatmap_legend_param = list(direction = "vertical", ncol=1,
+                                    title_gp=gpar(fontsize=14), labels_gp=gpar(fontsize=14)),
+        column_gap=unit(0.75, "mm"),
+        top_annotation=col.annot,
+        right_annotation = rowAnno)
+dev.off()
+
+Heatmap(hm.exprs, col=hm.cols, name="Z-score",
+        column_split=col.breaks, jitter=FALSE,
+        use_raster=TRUE, cluster_rows=TRUE,
+        cluster_columns = FALSE, show_column_names=FALSE,
+        show_row_names = FALSE,
+        column_title=NULL,
+        row_names_gp=gpar(fontsize=14),
+        column_title_gp=gpar(fontsize=14),
+        heatmap_legend_param = list(direction = "vertical", ncol=1,
+                                    title_gp=gpar(fontsize=14), labels_gp=gpar(fontsize=14)),
+        column_gap=unit(0.75, "mm"),
+        top_annotation=col.annot,
+        right_annotation = rowAnno)
+```
+
+
+
+
+```{r}
+sink(file="/dev/null")
+rm(list=c("rand.flu.milo", "rand.ni.milo", "rand.flu.meta", "rand.ni.meta"))
+gc()
+sink(file=NULL)
+```
+
+
+# All PBMCs
+
+Separation is a big issue in these data - I need to ensure that the nhoods contain cells from both conditions. I also need to include a check for model separation into the main 
+code base.
+
+```{r}
+rand.all.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_FALSE_Milo.RDS")
+rand.all.meta <- as.data.frame(colData(rand.all.milo))
+rand.all.meta$CellID <- colnames(rand.all.milo)
+rand.all.fr <- as.data.frame(reducedDim(rand.all.milo, "UMAP"))
+rand.all.fr$CellID <- colnames(rand.all.milo)
+
+rand.all.meta <- merge(rand.all.meta, rand.all.fr, by="CellID")
+```
+
+
+```{r}
+param <- MulticoreParam(workers=6)
+register(param)
+set.seed(42)
+
+rand.all.milo <- buildGraph(rand.all.milo, k=120, d=50, reduced.dim="Cosine.MNN", BPPARAM=param)
+rand.all.milo <- makeNhoods(rand.all.milo, prop=0.01, k=120, d=50, refinement_scheme="graph")
+rand.all.milo <- countCells(rand.all.milo, samples="sample_condition", meta.data=colData(rand.all.milo))
+rand.all.milo <- buildNhoodGraph(rand.all.milo, overlap=10)
+```
+
+```{r, fig.height=5, fig.width=7}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.all.meta$ident)))
+names(ct_cols) <- unique(rand.all.meta$ident)
+
+ggplot(rand.all.meta, aes(x=UMAP1, y=UMAP2, colour=ident)) +
+    geom_scattermore(pointsize=0.75) +
+    scale_colour_manual(values=ct_cols) +
+    theme_cowplot() +
+    guides(colour=guide_legend(override.aes = list(size=5, shape=15))) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_cellTypes-UMAP.png",
+       height=5, width=7, dpi=300, bg='white')
+```
+
+To get rid of the batch effect I had to integrate the infected and mock-infected cells - this is probably going to cause a problem for the DA analysis.
+
+```{r, fig.height=4.5, fig.width=11}
+ggplot(rand.all.meta, aes(x=UMAP1, y=UMAP2)) +
+    geom_scattermore(data=rand.all.meta[, c("UMAP1", "UMAP2")],
+                     pointsize=0.5, colour='grey80') +
+    geom_scattermore(aes(colour=SOC_infection_status), pointsize=0.75) +
+    scale_colour_d3() +
+    facet_wrap(~SOC_infection_status) +
+    theme_cowplot()
+```
+
+The integration is much better now. We should inspect the mean-variance relationship in the nhoods counts matrix.
+
+```{r}
+mu.var.df <- data.frame("Mean"=rowMeans2(nhoodCounts(rand.all.milo)),
+                        "Var"=rowVars(nhoodCounts(rand.all.milo)))
+
+ggplot(mu.var.df, aes(x=Mean, y=Var)) +
+    geom_point() +
+    geom_smooth() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    NULL
+```
+
+The red line denotes the x=y, i.e. Poisson expected variance line. Clearly there is overdispersion so an overdispersed model is appropriate. The blue line is the best fit GAM using 
+a cubic spline with shrinkage. This probably isn't too far off the dispersion estimation used by edgeR.
+
+```{r}
+ggplot(mu.var.df, aes(x=Mean, y=Var)) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    geom_smooth() +
+    theme_cowplot() +
+    scale_y_log10() +
+    scale_x_log10() +
+    NULL
+```
+
+This is the same plot as above, on a log scale.
+
+```{r}
+plotNhoodSizeHist(rand.all.milo)
+```
+
+Check for separation in nhoods.
+
+```{r}
+test.meta <- rand.all.meta[, 
+                        c("orig.ident", "batchID", "SOC_indiv_ID", "SOC_infection_status", "SOC_genetic_ancestry",
+                          "CEU", "YRI", "sample_condition", "ident", "CellID") ]
+test.meta <- test.meta[!duplicated(test.meta$sample_condition), ]
+rownames(test.meta) <- test.meta$sample_condition
+test.meta$SOC_infection_status <- factor(test.meta$SOC_infection_status, 
+                                         levels=c("flu", "NI"))
+table(test.meta$batchID, test.meta$SOC_infection_status)
+```
+
+
+```{r}
+nhood.counts.df <- data.frame(as.matrix(nhoodCounts(rand.all.milo)[c(1:9), , drop=FALSE]))
+nhood.counts.df <- tibble::rownames_to_column(nhood.counts.df, "subset.nhoods.id")
+nhood.counts.df.long <- tidyr::pivot_longer(nhood.counts.df,
+                                            cols=-1, # pivot all columns into longer format, except the first one.
+                                            names_to = "experiment",
+                                            values_to = "values")
+
+tmp.desgin <- tibble::rownames_to_column(test.meta, "experiment")[,c("experiment", "SOC_infection_status", "batchID", "SOC_genetic_ancestry")]
+nhood.counts.df.long <- dplyr::left_join(nhood.counts.df.long,
+                                         tmp.desgin,
+                                         by="experiment")
+nhood.counts.df.long$subset.nhoods.id <- paste("Nhood:", nhood.counts.df.long$subset.nhoods.id)
+
+ggplot(nhood.counts.df.long, aes(x=SOC_infection_status, y=values))+
+    geom_point()+
+    stat_summary(fun="mean", geom="crossbar",
+                 mapping=aes(ymin=after_stat(y), ymax=after_stat(y)), width=0.22,
+                 position=position_dodge(),show.legend = FALSE, color="red")+
+    facet_wrap(~subset.nhoods.id, ncol = 3)+
+    ylab("# cells in neighbourhood")
+```
+
+This is just the first 9 nhoods - I'll need to check if any have 0 counts in _any_ nhood.
+
+```{r}
+cond.vec <- test.meta$SOC_infection_status
+names(cond.vec) <- rownames(test.meta)
+
+any_separate <- apply(nhoodCounts(rand.all.milo)[, names(cond.vec)],
+                      FUN=function(NR, conditions, min.val=1) {
+                          cond.levels <- levels(conditions)
+                          nr.tab <- unlist(by(NR, INDICES=conditions, FUN=sum, simplify=FALSE))
+                          any(nr.tab < min.val)
+                      }, MARGIN=1, conditions=cond.vec, min.val=6)
+sum(any_separate)/length(any_separate)
+sum(any_separate)
+```
+
+This indicates that 48 nhoods are completely separated, i.e. there are 0 counts in one condition. This indicates the nhoods need to be larger still - increasing K seems to help 
+in this respect.
+
+```{r}
+# stop("stop here")
+```
+
+I want to illustrate how the GLM without any adjustment for individual should have an elevated type I error rate.
+
+```{r, warning=FALSE}
+set.seed(42)
+
+glm.res <- testNhoods(rand.all.milo, design.df=test.meta, 
+                       design= ~ SOC_infection_status, reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param, subset.nhoods = !any_separate)
+head(glm.res)
+```
+
+
+```{r}
+indiv.mat <- model.matrix(~ 0 + SOC_indiv_ID, data=test.meta) %*% t(model.matrix(~ 0 + SOC_indiv_ID, data=test.meta))
+
+png("~/Dropbox/GLMM/plots/Randolph_All_blockMatrix.png",
+    height=4, width=4, units="in", res=300)
+image(indiv.mat)
+dev.off()
+```
+
+
+
+```{r}
+exp.p <- runif(nrow(glm.res))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.res <- glm.res[order(glm.res$PValue, decreasing=FALSE), ]
+glm.res$ExpP <- exp.p
+
+ggplot(glm.res, aes(x=-log10(ExpP), y=-log10(SpatialFDR))) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " Expected P-value")), y=expression(paste("-log"[10], " GLM Spatial FDR"))) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_noAdjustGLM-QQplot.png",
+       height=4.5, width=4.5, dpi=300, bg='white')
+```
+
+These are the NB-GLMM p-values, which indicates they are over-inflated.
+
+```{r}
+ggplot(glm.res, aes(x=logCPM, y=logFC, colour=SpatialFDR < 0.1)) +
+    geom_point() +
+    theme_cowplot() +
+    scale_colour_manual(values=c("black", "red")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_All_noadjustGLM-MAplot.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+
+## DA testing with batch adjustment
+
+```{r}
+sum_i=function(i) {
+    return(sum(1:i))
+}
+
+
+GRMreader=function(filenm, flag=1) {
+    xDt.bin <- paste(filenm, ".grm.bin", sep="")
+    xDt.nfl <- paste(filenm, ".grm.N.bin", sep="")
+    xDt.gid <- paste(filenm, ".grm.id", sep="")
+    
+    xDt.id <- read.table(xDt.gid)
+    xDt.n <- dim(xDt.id)[1]
+    xDt.grm <- readBin(file(xDt.bin, "rb"), n=xDt.n*(xDt.n+1)/2, what=numeric(0), size=4)
+    
+    sn <- sapply(1:xDt.n, sum_i)
+    off <- xDt.grm[-sn]
+    diag <- xDt.grm[sn]
+    if(flag==1) {
+        return(list(diag=diag, off=off, n=xDt.n))
+    } else {
+        xDt.mat <- matrix(data=NA, nrow=xDt.n, ncol=xDt.n)
+        xDt.mat[upper.tri(xDt.mat)] <- off
+        xDt.mat <- t(xDt.mat)
+        xDt.mat[upper.tri(xDt.mat)] <- off
+        diag(xDt.mat) <- diag
+        dimnames(xDt.mat) <- list(xDt.id$V1, xDt.id$V2)
+        
+    return(list(mat=xDt.mat, n=xDt.n))
+    }
+}
+```
+
+
+Setup the design matrix and test nhoods. What about adjusting for the paired samples? I'll try it with a GRM - this one is computed genome-wide but leaving out Chromosome 22 (these 
+were created for a LOCO GWAS).
+
+```{r}
+# read in a GCTA GRM
+grm.mat <- GRMreader("~/Dropbox/GLMM/data/Chr22", flag=2)$mat
+
+# drop the individual with all 0
+
+rownames(grm.mat) <- paste0(rownames(grm.mat), "_NI")
+colnames(grm.mat) <- paste0(colnames(grm.mat), "_NI")
+
+
+# need to double the matrix
+test.kin <- matrix(0L, nrow=nrow(test.meta), ncol=nrow(test.meta), dimnames=list(rownames(test.meta), rownames(test.meta)))
+test.kin[rownames(grm.mat), colnames(grm.mat)] <- grm.mat
+
+rownames(grm.mat) <- gsub(rownames(grm.mat), pattern="_NI", replacement="_flu")
+colnames(grm.mat) <- gsub(colnames(grm.mat), pattern="_NI", replacement="_flu")
+test.kin[rownames(grm.mat), colnames(grm.mat)] <- grm.mat
+
+test.kin <- test.kin[rownames(test.meta)[order(test.meta$SOC_infection_status, test.meta$SOC_indiv_ID)], 
+                     rownames(test.meta)[order(test.meta$SOC_infection_status, test.meta$SOC_indiv_ID)]]
+
+test.kin <- test.kin[rowSums(test.kin) != 0, colSums(test.kin) != 0]
+```
+
+
+```{r}
+image(test.kin)
+```
+
+Is the duplicate individual causing the issues? I'll one of them.
+
+```{r}
+png("~/Dropbox/GLMM/plots/Randolph_All_KinshipMatrix.png",
+    height=8, width=8, res=300, units="in")
+image(test.kin[!rownames(test.kin) %in% rownames(test.kin)[rowSums(test.kin == test.kin[1680]) > 0] ,
+               !colnames(test.kin) %in% rownames(test.kin)[rowSums(test.kin == test.kin[1680]) > 0] ])
+dev.off()
+
+image(test.kin[!rownames(test.kin) %in% rownames(test.kin)[rowSums(test.kin == test.kin[1680]) > 0] ,
+               !colnames(test.kin) %in% rownames(test.kin)[rowSums(test.kin == test.kin[1680]) > 0] ])
+```
+
+```{r}
+# only remove on individual
+drop.dup <- unique(gsub(rownames(test.kin)[rowSums(test.kin == test.kin[1680]) > 0], pattern="_(flu|NI)", replacement=""))[1] # only remove one of the duplicates
+
+test.kin <- test.kin[!rownames(test.kin) %in% c(paste0(drop.dup, "_flu"), paste0(drop.dup, "_NI")) ,
+                     !colnames(test.kin) %in% c(paste0(drop.dup, "_flu"), paste0(drop.dup, "_NI")) ]
+
+png("~/Dropbox/GLMM/plots/Randolph_KinshipMatrix.png",
+    height=4, width=4, res=300, units="in")
+image(test.kin[c(1:(nrow(test.kin)/2)), c(1:(nrow(test.kin)/2))])
+dev.off()
+
+image(test.kin[c(1:(nrow(test.kin)/2)), c(1:(nrow(test.kin)/2))])
+```
+
+
+```{r, warning=FALSE}
+block.mat <- matrix(0L, ncol=ncol(test.kin), nrow=nrow(test.kin), dimnames=list(rownames(test.kin), colnames(test.kin)))
+block.mat[grepl(rownames(block.mat), pattern="flu"), grepl(colnames(block.mat), pattern="flu")] <- 1
+block.mat[grepl(rownames(block.mat), pattern="NI"), grepl(colnames(block.mat), pattern="NI")] <- 1
+
+
+glmm.res <- testNhoods(rand.all.milo, design.df=test.meta[rownames(test.kin), ], 
+                       design= ~ SOC_infection_status, kinship=test.kin, reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       subset.nhoods=!any_separate,
+                       BPPARAM=param)
+
+sum(glmm.res$Converged)/nrow(glmm.res)
+head(glmm.res)
+```
+
+Plot the results in an MA plot to check for sanity. We want to see LFC values distributed around 0. I should have a sanity check on the nhoods that do and do not converge.
+
+```{r}
+ggplot(glmm.res, aes(x=logCPM, y=logFC, colour=SpatialFDR < 0.1)) +
+    geom_point() +
+    theme_cowplot() +
+    scale_colour_manual(values=c("black", "red")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolp_All_kinshipRandVar-MAplot.png",
+       height=4, width=6.5, bg='white', dpi=300)
+```
+
+
+```{r}
+glmm.res <- annotateNhoods(rand.all.milo, glmm.res, "ident", subset.nhoods=!any_separate)
+
+plotDAbeeswarm(glmm.res, alpha=0.1, group.by="ident")
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_kinshipRandVar-beeswarm.png",
+       height=5, width=7, dpi=300, bg='white')
+```
+
+These results suggest that individuals classified as AFR ancestry have marginally more monocytes and slightly fewer CD8+ T cells compared to individuals 
+classified as EUR ancestry. This may in part explain some of the differences in the infected cells. By looking at all conditions the effects are notably stronger, and we can 
+also see differences in the NK_high_response, B cells and DC clusters as well.
+
+```{r}
+plotNhoodGraphDA(rand.all.milo, glmm.res, alpha=0.01, layout="UMAP", subset.nhoods=!any_separate)
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_kinshipRandVar-NhoodGraph.png",
+       height=5, width=7.5, dpi=300, bg='white')
+```
+
+I got this working with the kinship matrix and infection status - now let's try it with infection status and batch ID (this will be compared to the GLM).
+
+```{r, warning=FALSE}
+glmm.res <- testNhoods(rand.all.milo, design.df=test.meta[rownames(test.kin), ], 
+                       design= ~ SOC_infection_status + (1|batchID), reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       subset.nhoods= !any_separate,
+                       BPPARAM=param)
+
+sum(glmm.res$Converged)/nrow(glmm.res)
+head(glmm.res)
+```
+
+I need to subset to nhoods with >=7 counts to prevent the model failing.
+
+```{r}
+ggplot(glmm.res, aes(x=logCPM, y=logFC)) +
+    geom_point() +
+    theme_cowplot() +
+    NULL
+```
+
+
+```{r}
+glmm.res <- annotateNhoods(rand.all.milo, glmm.res, "ident", subset.nhoods= !any_separate) # I need to extend this to handle subset results
+plotDAbeeswarm(glmm.res[!is.na(glmm.res$logFC), ], alpha=0.01, group.by="ident")
+```
+
+These results suggest that individuals classified as AFR ancestry have marginally more monocytes and slightly fewer CD8+ T cells compared to individuals 
+classified as EUR ancestry. This may in part explain some of the differences in the infected cells. By looking at all conditions the effects are notably stronger, and we can 
+also see differences in the NK_high_response, B cells and DC clusters as well.
+
+```{r}
+plotNhoodGraphDA(rand.all.milo, glmm.res, alpha=0.01, layout="UMAP", subset.nhoods= !any_separate) # I need to extend this to handle subset results
+```
+
+How do these results compare to those from the GLM adjusted for batch as a fixed effect?
+
+```{r}
+# need a picture of the NxN batch matrix of Z
+batch.z <- model.matrix(~ 0 + batchID, data=test.meta)
+colnames(batch.z) <- gsub(colnames(batch.z), pattern="batchID", replacement="")
+
+z.covar <- batch.z %*% t(batch.z)
+
+png("~/Dropbox/GLMM/plots/Randolph_All_batchMatrix.png",
+    height=4, width=4, res=300, units="in")
+image(z.covar)
+dev.off()
+```
+
+
+
+```{r, warning=FALSE}
+set.seed(42)
+
+glm.res <- testNhoods(rand.all.milo, design.df=test.meta, 
+                       design= ~ batchID + SOC_infection_status, reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param, subset.nhoods = !any_separate)
+head(glm.res)
+```
+
+```{r}
+ggplot(glm.res, aes(x=logCPM, y=logFC)) +
+    geom_point() +
+    theme_cowplot() +
+    NULL
+```
+
+Compare the results between the GLM and GLMM.
+
+```{r}
+glm.glmm.comp <- merge(glm.res, glmm.res, by=c("Nhood"))
+glm.glmm.comp$Sig <- "None"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "Both"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y >= 0.1] <- "GLM"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x >= 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "GLMM"
+
+ggplot(glm.glmm.comp, aes(x=logFC.x, y=logFC.y, colour=Sig)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x="GLM LFC", y="GLMM LFC") +
+    scale_colour_manual(values=c("red", "orange", "purple", "grey")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_GLMvsGLMM_LFC.png",
+       height=5, width=6, bg='white', dpi=300)
+```
+
+These results are relatively concordant. However, there are results unique to each. It is important to note that the GLM doesn't account for the fact that there are 2 measurements 
+for each individual.
+
+This also shows that we have more power to identify DA nhoods with the GLMM (assuming these aren't just false discoveries). I'll 
+compare the GLMM DA results to the annotated clusters.
+
+```{r}
+glm.res <- annotateNhoods(rand.all.milo, glm.res, "ident", subset.nhoods= !any_separate)
+plotDAbeeswarm(glm.res, alpha=0.1, group.by="ident")
+```
+These results look very similar to those from the GLMM.
+
+Either this means that the GLMM is more powerful, or the type I error rate is inflated. Need to check the p-value QQ-plots.
+
+```{r}
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$PValue.y, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.y <- exp.p
+
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$PValue.x, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.x <- exp.p
+
+ggplot(glm.glmm.comp, aes(x=-log10(ExpP.y), y=-log10(PValue.y))) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " Expected P-value")), y=expression(paste("-log"[10], " GLMM P-value"))) +
+    NULL
+```
+
+These are the NB-GLMM p-values, which indicates they are over-inflated.
+
+```{r}
+ggplot(glm.glmm.comp, aes(x=-log10(ExpP.x), y=-log10(PValue.x))) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " Expected P-value")), y=expression(paste("-log"[10], " GLM P-value"))) +
+    NULL
+```
+
+The GLM P-values are also poorly calibrated - this is probably due to the duplicate observations for each individual which violates the i.i.d assumption.
+
+```{r}
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$SpatialFDR.y, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.y <- exp.p
+
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$SpatialFDR.x, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.x <- exp.p
+
+ggplot(glm.glmm.comp, aes(x=SpatialFDR.y)) +
+    geom_histogram(bins=50) +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " GLMM Spatial FDR"))) +
+    NULL
+```
+
+These are the NB-GLMM spatial FDRs which seem to control the type I error better - there isn't any indication of a signal here. Should I be concerned that the distribution isn't 
+more uniform, or is this just noise?
+
+```{r}
+ggplot(glm.glmm.comp, aes(x=SpatialFDR.x)) +
+    geom_histogram(bins=50) +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " GLM Spatial FDR"))) +
+    NULL
+```
+
+The GLM FDR are even more conservative. I'll check that we are actually controlling the FDR at the expected rate.
+
+```{r}
+glmm.fdr.df <- data.frame("FDR"=c(0.1, 0.05, 0.01, 0.001), "Discoveries"=unlist(sapply(c(0.1, 0.05, 0.01, 0.001),
+                                                                                       FUN=function(FX) sum(glm.glmm.comp$SpatialFDR.y < FX, na.rm=TRUE))),
+                          "Model"=rep("GLMM", 4))
+glm.fdr.df <- data.frame("FDR"=c(0.1, 0.05, 0.01, 0.001), "Discoveries"=unlist(sapply(c(0.1, 0.05, 0.01, 0.001),
+                                                                                      FUN=function(FX) sum(glm.glmm.comp$SpatialFDR.x < FX, na.rm=TRUE))),
+                         "Model"=rep("GLM", 4))
+fdr.df <- do.call(rbind.data.frame, list(glmm.fdr.df, glm.fdr.df))
+
+ggplot(fdr.df, aes(x=log10(FDR), y=Discoveries/nrow(glm.glmm.comp), fill=Model)) +
+    geom_bar(stat='identity', position='dodge') +
+    theme_cowplot() +
+    scale_fill_npg() +
+    labs(x=expression(paste("Expected log"[10], " FDR")), y="Proportion of discoveries") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_GLMvsGLMM_FDR-barplot.png",
+       height=3.5, width=6, dpi=300, bg='white')
+```
+
+This looks like there are more discoveries in the GLM than the GLMM, which is surprising. However, I suspect this is also down to an inflated type I error rate in the GLM with 
+the repeated observations.
+
+
+What happens if we just adjust for the individual but not batch?
+
+```{r, warning=FALSE}
+glmm.res <- testNhoods(rand.all.milo, design.df=test.meta[rownames(test.kin), ], 
+                       design= ~ SOC_infection_status + (1|SOC_indiv_ID), reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       subset.nhoods= !any_separate,
+                       BPPARAM=param)
+
+sum(glmm.res$Converged)/nrow(glmm.res)
+table(glmm.res$SpatialFDR < 0.1)
+head(glmm.res)
+```
+
+
+```{r, warning=FALSE}
+set.seed(42)
+
+glm.res <- testNhoods(rand.all.milo, design.df=test.meta, 
+                       design= ~ SOC_infection_status, reduced.dim="Cosine.MNN",
+                       fdr.weighting="graph-overlap", glmm.solver="HE-NNLS", max.iter=51,
+                       BPPARAM=param, subset.nhoods = !any_separate)
+
+table(glm.res$SpatialFDR < 0.1)
+head(glm.res)
+```
+
+
+```{r}
+glm.glmm.comp <- merge(glm.res, glmm.res, by=c("Nhood"))
+glm.glmm.comp$Sig <- "None"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "Both"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x < 0.1 & glm.glmm.comp$SpatialFDR.y >= 0.1] <- "GLM"
+glm.glmm.comp$Sig[glm.glmm.comp$SpatialFDR.x >= 0.1 & glm.glmm.comp$SpatialFDR.y < 0.1] <- "GLMM"
+
+ggplot(glm.glmm.comp, aes(x=logFC.x, y=logFC.y, colour=Sig)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x="GLM LFC", y="GLMM LFC") +
+    scale_colour_manual(values=c("red", "orange", "purple", "grey")) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_DonorID-GLMvsGLMM_LFC.png",
+       height=5, width=6, bg='white', dpi=300)
+```
+
+These results are relatively concordant. However, there are results unique to each. It is important to note that the GLM doesn't account for the fact that there are 2 measurements 
+for each individual.
+
+Either this means that the GLMM is more powerful, or the type I error rate is inflated. Need to check the p-value QQ-plots.
+
+```{r}
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$PValue.y, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.y <- exp.p
+
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$PValue.x, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.x <- exp.p
+
+ggplot(glm.glmm.comp, aes(x=-log10(ExpP.y), y=-log10(PValue.y))) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " Expected P-value")), y=expression(paste("-log"[10], " GLMM P-value"))) +
+    NULL
+```
+
+These are the NB-GLMM p-values, which indicates they are over-inflated.
+
+```{r}
+ggplot(glm.glmm.comp, aes(x=-log10(ExpP.x), y=-log10(PValue.x))) +
+    geom_point() +
+    geom_abline(lty=2, colour='red') +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " Expected P-value")), y=expression(paste("-log"[10], " GLM P-value"))) +
+    NULL
+```
+
+The GLM P-values are also poorly calibrated - this is probably due to the duplicate observations for each individual which violates the i.i.d assumption.
+
+```{r}
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$SpatialFDR.y, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.y <- exp.p
+
+exp.p <- runif(nrow(glm.glmm.comp))
+exp.p <- exp.p[order(exp.p, decreasing=FALSE)]
+glm.glmm.comp <- glm.glmm.comp[order(glm.glmm.comp$SpatialFDR.x, decreasing=FALSE), ]
+glm.glmm.comp$ExpP.x <- exp.p
+
+ggplot(glm.glmm.comp, aes(x=SpatialFDR.y)) +
+    geom_histogram(bins=50) +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " GLMM Spatial FDR"))) +
+    NULL
+```
+
+These are the NB-GLMM spatial FDRs which seem to control the type I error better - there isn't any indication of a signal here. Should I be concerned that the distribution isn't 
+more uniform, or is this just noise?
+
+```{r}
+ggplot(glm.glmm.comp, aes(x=SpatialFDR.x)) +
+    geom_histogram(bins=50) +
+    theme_cowplot() +
+    labs(x=expression(paste("-log"[10], " GLM Spatial FDR"))) +
+    NULL
+```
+
+The GLM FDR are even more conservative. I'll check that we are actually controlling the FDR at the expected rate.
+
+```{r}
+glmm.fdr.df <- data.frame("FDR"=c(0.1, 0.05, 0.01, 0.001), "Discoveries"=unlist(sapply(c(0.1, 0.05, 0.01, 0.001),
+                                                                                       FUN=function(FX) sum(glm.glmm.comp$SpatialFDR.y < FX, na.rm=TRUE))),
+                          "Model"=rep("GLMM", 4))
+glm.fdr.df <- data.frame("FDR"=c(0.1, 0.05, 0.01, 0.001), "Discoveries"=unlist(sapply(c(0.1, 0.05, 0.01, 0.001),
+                                                                                      FUN=function(FX) sum(glm.glmm.comp$SpatialFDR.x < FX, na.rm=TRUE))),
+                         "Model"=rep("GLM", 4))
+fdr.df <- do.call(rbind.data.frame, list(glmm.fdr.df, glm.fdr.df))
+
+ggplot(fdr.df, aes(x=log10(FDR), y=Discoveries/nrow(glm.glmm.comp), fill=Model)) +
+    geom_bar(stat='identity', position='dodge') +
+    theme_cowplot() +
+    scale_fill_npg() +
+    labs(x=expression(paste("Expected log"[10], " FDR")), y="Proportion of discoveries") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_All_DonorID_GLMvsGLMM_FDR-barplot.png",
+       height=3.5, width=6, dpi=300, bg='white')
+```
+
+This looks like there are more discoveries in the GLM than the GLMM, which is surprising. However, I suspect this is also down to an inflated type I error rate in the GLM with 
+the repeated observations.
+
+## Assessing FDR rate
+
+As we don't know the ground truth I'll compare these to randomly shuffled data as a null distribution of the number of false discoveries.
+
+```{r, fig.height=2.5, fig.width=4.5}
+mock.shuffled <- read.table("~/Dropbox/GLMM/data/Randolph_Mockshuffled_GLMM_results.tsv",
+                            sep="\t", header=TRUE, stringsAsFactors = FALSE)
+mock.shuffled$Sig <- as.numeric(mock.shuffled$SpatialFDR < 0.1)
+mock.fdr <- mock.shuffled %>% group_by(Nhood) %>% summarise(null.FDR=sum(Sig)/ max(mock.shuffled$NBoot))
+
+ggplot(mock.fdr, aes(x=null.FDR)) +
+    geom_density() +
+    theme_cowplot() +
+    labs(y="Density", x="Proportion of random discoveries (10%FDR)") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_Mock_nullFDR-density.png",
+       height=2.5, width=4.5, dpi=300, bg='white')
+```
+
+Here we can see that we control the FDR well below the expected level using a null distribution of shuffled labels. 
+
+```{r, fig.height=2.5, fig.width=4.5}
+flu.shuffled <- read.table("~/Dropbox/GLMM/data/Randolph_flushuffled_GLMM_results.tsv",
+                            sep="\t", header=TRUE, stringsAsFactors = FALSE)
+flu.shuffled$Sig <- as.numeric(flu.shuffled$SpatialFDR < 0.1)
+flu.fdr <- flu.shuffled %>% group_by(Nhood) %>% summarise(null.FDR=sum(Sig)/ max(flu.shuffled$NBoot))
+
+ggplot(flu.fdr, aes(x=null.FDR)) +
+    geom_density() +
+    theme_cowplot() +
+    labs(y="Density", x="Proportion of random discoveries (10%FDR)") +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_flu_nullFDR-density.png",
+       height=2.5, width=4.5, dpi=300, bg='white')
+```
+
+We can see a very similar distribution here for the flue infrected cells.
+
+

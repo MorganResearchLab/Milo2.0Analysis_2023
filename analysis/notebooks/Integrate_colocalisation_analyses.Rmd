@@ -1,0 +1,1113 @@
+---
+title: "Colocalisation integrative analysis"
+output: html_notebook
+---
+
+We have colocalisation analyses to link csQTLs to human traits-associated loci and csQTLs linked to cell state-specific gene expression. Now we wish to integrate these together to build a 
+concrete link from DNA to trait via gene regulation and cell state abundance.
+
+
+```{r}
+suppressMessages({
+library(SingleCellExperiment)
+library(miloR)
+library(Matrix)
+library(MatrixGenerics)
+library(ggplot2)
+library(ggsci)
+library(ggrepel)
+library(cowplot)
+library(scales)
+library(scattermore)
+library(BiocParallel)
+library(MatrixEQTL)
+library(biomaRt)
+library(stringr)
+library(dplyr)
+library(coloc)
+library(ggvenn)
+library(scico)
+library(viridis)
+library(ggtext)
+library(glue)
+library(RColorBrewer)
+library(wordcloud)
+library(wordcloud2)
+library(webshot)
+library(htmlwidgets)
+library(tm)
+library(ggrastr)
+library(colorspace)
+})
+```
+
+# Read in Milo object
+
+```{r}
+rand.ni.milo <- readRDS("~/Dropbox/GLMM/data/Randolph_Milo.RDS")
+rand.ni.meta <- as.data.frame(colData(rand.ni.milo))
+rand.ni.meta$CellID <- colnames(rand.ni.milo)
+rand.ni.fr <- as.data.frame(reducedDim(rand.ni.milo, "UMAP"))
+rand.ni.fr$CellID <- colnames(rand.ni.milo)
+
+rand.ni.meta <- merge(rand.ni.meta, rand.ni.fr, by="CellID")
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+```
+
+```{r}
+# use this for annotating the csQTL results
+glmm.da.res <- read.table("~/Dropbox/GLMM/results/Randolph_MockGLMM_results.tsv",
+                      sep="\t", header=TRUE, stringsAsFactors = FALSE)
+```
+
+
+```{r}
+csqtl.eqtl.coloc.df <- read.table("~/Dropbox/GLMM/results/CellState_eQTL_coloc.tsv",
+                                  sep="\t", header=TRUE, stringsAsFactors=FALSE)
+```
+
+
+# Compare colocalised eQTLs and GWAS traits with csQTLs
+
+```{r}
+panukbb.coloc.df <- read.table("~/Dropbox/GLMM/results/PanUKBB_colocPP4_results.tsv",
+                               sep="\t", header=TRUE, stringsAsFactors=FALSE)
+panukbb.coloc.df$Study <- "PanUKBB"
+
+finngen.coloc.df <- read.table("~/Dropbox/GLMM/results/FinnGen_colocPP4_results.tsv",
+                               sep="\t", header=TRUE, stringsAsFactors=FALSE)
+finngen.coloc.df$Study <- "FinnGen"
+finngen.coloc.df$PhenoDescription <- finngen.coloc.df$FinnGenPheno
+
+common.cols <- intersect(colnames(panukbb.coloc.df), colnames(finngen.coloc.df))
+
+combined.coloc.df <- do.call(rbind.data.frame, list(panukbb.coloc.df[, common.cols], finngen.coloc.df[, common.cols]))
+```
+
+I've loaded in the results from the colocalisation analysis between csQTLs and GWAS traits with a PP H4>=0.75. How many traits are colocalised in each?
+
+```{r, fig.height=3.9, fig.width=2.25}
+ggplot(combined.coloc.df, aes(x=Study, fill=ident)) +
+  geom_bar(position="dodge", colour='black') +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto"),
+        axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        legend.position="bottom", legend.direction="vertical") +
+  scale_fill_manual(values=ct_cols) +
+  labs(x="Study", y="#csQTL-trait pairs") +
+  guides(fill=guide_legend(title="Cell type")) +
+  NULL
+  
+ggsave("~/Dropbox/GLMM/plots/TraitColoc-summary-bar.png",
+       height=3.9, width=2.25, dpi=300, bg='white')
+```
+
+How many of these are concretely immune-mediated?
+
+```{r}
+immune.trait.patterns <- c("scleroderma", "rheumatoid", "psoriasis", "asthma", "candidiasis", "pneumonia", "diabetes", "hayfever", "rhinitis", "allergy",
+                           "monocyte", "eosinophil", "neutrophil", "lymphocyte", "arthritis", "basophil", "synovitis", "inflammation", "tonsillitis", "viral",
+                           "bacteria", "bacterial", "immune", "\\<enteritis\\>", "\\<inflammatory\\>", "rheumatoid", "eczema", "sarcoidosis", "\\<rheuma\\>",
+                           "autoimmune", "antibody", "psori", "mumps", "cholangi", "alopeca", "juven_arth", "allergic", "psoriarth", "spleen", "polymyalgia",
+                           "spondylo", "tonsil", "sjogren", "cholera", "sepsis", "vitiligo", "encephalitis", "fibromyalgia", "syphilis", "\\<ipf\\>")
+
+all.immune.traits <- combined.coloc.df$PhenoDescription[grepl(str_to_lower(combined.coloc.df$PhenoDescription), pattern=paste(immune.trait.patterns, collapse="|"))]
+table(combined.coloc.df$PhenoCat[grepl(str_to_lower(combined.coloc.df$PhenoDescription), pattern=paste(immune.trait.patterns, collapse="|"))])
+```
+
+How about a word cloud here?
+
+```{r, fig.height=4, fig.width=4}
+immune.docs <- Corpus(VectorSource(gsub(all.immune.traits, pattern="_", replacement=" ")))
+immune.docs <- immune.docs %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(stripWhitespace)
+immune.docs <- tm_map(immune.docs, content_transformer(tolower))
+immune.docs <- tm_map(immune.docs, removeWords, stopwords("english"))
+
+# create a document-term-matrix
+immune.dtm <- TermDocumentMatrix(immune.docs) 
+immune.matrix <- as.matrix(immune.dtm) 
+immune.words <- sort(rowSums(immune.matrix),decreasing=TRUE) 
+immune.df <- data.frame(word = names(immune.words),freq=immune.words)
+
+set.seed(42) # for reproducibility 
+png("~/Dropbox/GLMM/plots/Trait_wordcloud.png", height=4, width=4, res=300, units="in")
+wordcloud(words = immune.df$word, freq = immune.df$freq, min.freq = 1,
+          max.words=200, random.order=FALSE, rot.per=0.35,
+          colors=brewer.pal(8, "Dark2"))
+dev.off()
+
+wordcloud(words = immune.df$word, freq = immune.df$freq, min.freq = 1,
+          max.words=200, random.order=FALSE, rot.per=0.35,
+          colors=brewer.pal(8, "Dark2"))
+
+# immune.cloud <- wordcloud2(data=immune.df, size=1.6, color='random-dark')
+# 
+# saveWidget(immune.cloud, "tmp.html", selfcontained = F)
+# webshot("tmp.html", file="Trait_wordcloud.png", delay = 5, vwidth = 2000, vheight = 2000)
+```
+
+How many csQTLs are commonly colocalised between PanUKBB and FinnGen?
+
+```{r, fig.height=3, fig.width=2}
+trait.xtab <- as.matrix(table(combined.coloc.df$csQTL[grepl(str_to_lower(combined.coloc.df$PhenoDescription), pattern=paste(immune.trait.patterns, collapse="|"))],
+                              combined.coloc.df$Study[grepl(str_to_lower(combined.coloc.df$PhenoDescription), pattern=paste(immune.trait.patterns, collapse="|"))]))
+
+
+trait.xtab.df <- data.frame("csQTL"=rownames(trait.xtab),
+                            "is.FinnGene"=ifelse(apply(trait.xtab, 1, FUN=function(LX) LX[1] >=1), TRUE, FALSE),
+                            "is.PanUKBB"=ifelse(apply(trait.xtab, 1, FUN=function(LX) LX[2] >=1), TRUE, FALSE),
+                            "is.coloc"=ifelse(apply(trait.xtab > 0, 1, FUN=function(LX) sum(LX)) >= 1, TRUE, FALSE))
+
+trait.xtab.df$Trait.Cat <- "No.Coloc"
+trait.xtab.df$Trait.Cat[trait.xtab.df$is.FinnGene & !trait.xtab.df$is.PanUKBB] <- "FinnGen"
+trait.xtab.df$Trait.Cat[!trait.xtab.df$is.FinnGene & trait.xtab.df$is.PanUKBB] <- "PanUKBB"
+trait.xtab.df$Trait.Cat[trait.xtab.df$is.FinnGene & trait.xtab.df$is.PanUKBB] <- "Both"
+trait.xtab.df$Trait.Cat <- factor(trait.xtab.df$Trait.Cat,
+                               levels=c("PanUKBB", "FinnGen", "Both", "No.Coloc"))
+
+ggplot(trait.xtab.df, aes(x=Trait.Cat)) +
+  geom_bar(colour='black') +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto", size=14),
+        axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+  labs(x="Immune trait\ncategory", y="#csQTLs") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/Randolph_TraitColocCounting-bar.png",
+       height=3, width=2, dpi=300, bg='white')
+```
+
+What are these 1 csQTLs and the corresponding traits?
+
+
+```{r, fig.height=9.5, fig.width=25}
+combined.coloc.df$BP <- as.numeric(gsub(combined.coloc.df$LeadSNP, pattern="([0-9+])_([0-9]+)_([ATCG]+)_([ATCG])",
+                                    replacement="\\2"))
+
+# only keep csQTLs in both studies and the corresponding traits.
+keep.csqtls <- unique(trait.xtab.df$csQTL[trait.xtab.df$Trait.Cat %in% c("Both")])
+
+
+ggplot(na.omit(combined.coloc.df[combined.coloc.df$csQTL %in% keep.csqtls, ]), 
+       aes(y=reorder(csQTL, CHR), 
+           x=paste(PhenoDescription, " (", Study, ")", sep=""), fill=PP.H4.abf)) +
+  geom_tile() +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto", size=16),
+        axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+  # scale_fill_scico(palette = "vik") +
+  # scale_fill_viridis(option="plasma") +
+  scale_fill_distiller(palette="YlOrRd", direction=1, breaks=c(0, 0.5, 1), limits=c(0, 1)) +
+  # facet_wrap(~CHR.Fac, scales="free", ncol=7) +
+  labs(y="csQTLs", x="Immune Traits") +
+  guides(fill=guide_colourbar(title="PP H4")) +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/TraitColoc-immunetrait-heatmap.png",
+       height=9.5, width=25, dpi=300, bg='white')
+```
+
+These are the broad categories in which the immune-related traits fall into. I'll now take the intersection of the csQTLs to look for loci that are eQTLs, csQTLs and trait associations.
+
+```{r, fig.height=4, fig.width=4}
+# qtl.venn.list <- list("Trait:csQTLs"=unique(combined.coloc.df$csQTL),
+#                       "eQTL:csQTLs"=unique(csqtl.eqtl.coloc.df$csQTL[csqtl.eqtl.coloc.df$PP.H4.abf >= 0.75]))
+
+qtl.venn.df <- data.frame("csQTL"=union(unique(combined.coloc.df$csQTL),
+                                        unique(csqtl.eqtl.coloc.df$csQTL[csqtl.eqtl.coloc.df$PP.H4.abf >= 0.75])))
+qtl.venn.df$Trait.csQTL <- qtl.venn.df$csQTL %in% unique(combined.coloc.df$csQTL)
+qtl.venn.df$eQTL.csQTL <- qtl.venn.df$csQTL %in% unique(csqtl.eqtl.coloc.df$csQTL[csqtl.eqtl.coloc.df$PP.H4.abf >= 0.75])
+
+# kudos to Allan Cameron for this solution: https://stackoverflow.com/questions/69699950/r-geom-venn-how-to-change-font
+
+venn_font <- function(p, font)
+{
+
+  grep_grob <- function(gt, lab){
+    which(sapply(gt, function(x) grepl(lab, x$name)))
+  }
+  
+  p2 <- ggplot_gtable(ggplot_build(p))
+  mygrobs <- p2$grobs
+  panel_grob <- mygrobs[[grep_grob(mygrobs, "panel")]]
+  venn_grob <- panel_grob$children[[grep_grob(panel_grob$children, "venn")]]
+  text_grob <- venn_grob$children[grep_grob(venn_grob$children, "text")]
+  text_grob <- do.call(grid::gList, 
+                       lapply(text_grob, 
+                              function(x) {x$gp$fontfamily <- font; 
+                                           x}))
+  venn_grob$children[grep_grob(venn_grob$children, "text")] <- text_grob
+  panel_grob$children[[grep_grob(panel_grob$children, "venn")]] <- venn_grob
+  mygrobs[[grep_grob(mygrobs, "panel")]] <- panel_grob
+  p2$grobs <- mygrobs
+  grid::grid.newpage()
+  grid::grid.draw(p2)
+  
+}
+
+
+g.venn <- ggplot(qtl.venn.df, aes(A=Trait.csQTL, B=eQTL.csQTL)) +
+  geom_venn(fill_color = c("orange", "skyblue"),
+            set_name_size=6,
+            show_percentage=FALSE, text_size=6) +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto"),
+        axis.line=element_blank(),
+        axis.text=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank()) +
+  guides(fill="none") +
+  coord_fixed() +
+  NULL
+
+venn_font(g.venn, font = "Roboto")
+
+ggsave(plot=venn_font(g.venn, font = "Roboto"),
+       file="~/Dropbox/GLMM/plots/VennDiagram_eQTL_panUKBBcoloc-overlap.png",
+       height=4, width=4, dpi=300, bg='white')
+```
+
+
+50 csQTLs overlap between GWAS colocalised traits and eQTLs - these are the priority csQTLs to look at. To further prioritise, I will select colocalised immune system traits, and 
+then take 2 examples: 1 CD8+ T cell csQTL and 1 monocyte csQTL.
+
+```{r}
+# list the immune traits
+overlap.csqtls <- intersect(unique(combined.coloc.df$csQTL), unique(csqtl.eqtl.coloc.df$csQTL[csqtl.eqtl.coloc.df$PP.H4.abf >= 0.75]))
+immune.csqtls <- unique(combined.coloc.df[combined.coloc.df$csQTL %in% overlap.csqtls & combined.coloc.df$PhenoDescription %in% all.immune.traits, ]$csQTL)
+length(immune.csqtls)
+```
+
+There are 41 csQTLs that correspond to both colocalised eQTLs _and_ immune system/infection traits.
+
+```{r}
+distinct(combined.coloc.df[combined.coloc.df$csQTL %in% overlap.csqtls & combined.coloc.df$PhenoDescription %in% all.immune.traits, ], csQTL, PhenoDescription, .keep_all=TRUE)
+```
+
+I'll merge these with the eQTL coloc results to bring the analyses together.
+
+```{r}
+overlap.csqtls.df <- combined.coloc.df[combined.coloc.df$csQTL %in% overlap.csqtls, c("Nhood", "LeadSNP", "csQTL", 
+                                                                                 "PhenoDescription", "PhenoCat", "PP.H4.abf", "nsnps", "Study")]
+colnames(overlap.csqtls.df) <- c(c("Nhood", "LeadSNP", "csQTL", "PhenoDescription", "PhenoCat", "Trait.PP.H4", "Trait.nsnps", "Study"))
+
+eqtl.csqtls <- csqtl.eqtl.coloc.df[csqtl.eqtl.coloc.df$csQTL %in% overlap.csqtls, c("Nhood", "LeadSNP", "csQTL", "Gene", "NhoodGroup", "ident", "CHR", "BP", "PP.H4.abf", "nsnps")]
+colnames(eqtl.csqtls) <- c("Nhood", "LeadSNP", "csQTL", "Gene", "NhoodGroup", "ident", "CHR", "BP", "eQTL.PP.H4", "eQTL.nsnps")
+
+comb.csqtls <- merge(eqtl.csqtls, overlap.csqtls.df, by=c("csQTL", "LeadSNP", "Nhood"))
+comb.csqtls$PhenoPretty <- str_wrap(str_to_sentence(comb.csqtls$PhenoDescription), width=50)
+```
+
+How many gene-trait pairs are there?
+
+```{r}
+gene.trait.pairs <- comb.csqtls[comb.csqtls$PhenoDescription %in% all.immune.traits, ] %>% group_by(Gene, PhenoPretty) %>% summarise("NCount"=n())
+gene.trait.pairs <- gene.trait.pairs[gene.trait.pairs$NCount >= 1, ]
+nrow(gene.trait.pairs)
+```
+
+The csQTLs act to link the eQTLs to the immune system traits.
+
+```{r, fig.width=20, fig.height=9}
+immunetrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("ImmuneSystem", "Immune", "Rheuma", "AutoImmune"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+immunetrait.vs.egene$CT.Col <- ifelse(immunetrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  immunetrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- immunetrait.vs.egene$Gene
+
+ggplot(immunetrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+
+```{r, fig.width=25, fig.height=10}
+infectiontrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("Infection", "Immune"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+infectiontrait.vs.egene$CT.Col <- ifelse(infectiontrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  infectiontrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- infectiontrait.vs.egene$Gene
+
+ggplot(infectiontrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+
+
+```{r, fig.width=25, fig.height=12}
+msktrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("Musculoskeletal"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+msktrait.vs.egene$CT.Col <- ifelse(msktrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  msktrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- msktrait.vs.egene$Gene
+
+ggplot(msktrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+
+```{r, fig.width=12, fig.height=5}
+biochemtrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("Biochemistry"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+biochemtrait.vs.egene$CT.Col <- ifelse(biochemtrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  biochemtrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- biochemtrait.vs.egene$Gene
+
+ggplot(biochemtrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+```{r, fig.width=21, fig.height=9}
+dermaltrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("Dermal"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+dermaltrait.vs.egene$CT.Col <- ifelse(dermaltrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  dermaltrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- dermaltrait.vs.egene$Gene
+
+ggplot(dermaltrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+
+```{r, fig.width=23, fig.height=11}
+gastrotrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("Gastrointestinal", "Digestive"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+gastrotrait.vs.egene$CT.Col <- ifelse(gastrotrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  gastrotrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- gastrotrait.vs.egene$Gene
+
+ggplot(gastrotrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+```{r, fig.width=30, fig.height=8}
+endocrinetrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoCat %in% c("Endocrine", "Diabetes"),] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+endocrinetrait.vs.egene$CT.Col <- ifelse(endocrinetrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  endocrinetrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene}</span>"
+  )
+names(ct.cols) <- endocrinetrait.vs.egene$Gene
+
+ggplot(endocrinetrait.vs.egene, aes(x=Gene, y=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_x_discrete(labels=ct.cols) +
+  theme(axis.text.x=element_markdown(angle=90, vjust=0.5, hjust=1, size=16, family="Roboto"),
+        axis.text.y=element_text(size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(y="PanUKBB Trait", x="eGene") +
+  NULL
+```
+
+
+```{r, fig.width=9, fig.height=10}
+immunetrait.vs.egene <- comb.csqtls[comb.csqtls$PhenoDescription %in% all.immune.traits,] %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+immunetrait.vs.egene$CT.Col <- ifelse(immunetrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+immunetrait.vs.egene$Gene.Fac <- factor(immunetrait.vs.egene$Gene,
+                                        levels=unique(immunetrait.vs.egene$Gene)[rev(order(unique(immunetrait.vs.egene$Gene, decreasing=TRUE)))])
+
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  immunetrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene.Fac}</span>"
+  )
+names(ct.cols) <- immunetrait.vs.egene$Gene.Fac
+
+ggplot(immunetrait.vs.egene, aes(y=Gene.Fac, x=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_y_discrete(labels=ct.cols, breaks=immunetrait.vs.egene$Gene.Fac) +
+  theme(axis.text.y=element_markdown(size=8, family="Roboto"),
+        axis.text.x=element_text(angle=90, vjust=0.5, hjust=1, size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(x="Trait", y="eGene") +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/ColocTraits_vs_Genes-allImmune.png",
+       height=10, width=16, dpi=600, bg='white')
+
+ggsave("~/Dropbox/GLMM/plots/ColocTraits_vs_Genes-allImmune.svg",
+       height=10, width=16, dpi=600, bg='white')
+```
+
+The pointsize for these genes is too small - I'll highlight a few genes of notable interest, e.g. SH2B3, MAPKAPK5, HLA-G, etc. How should these be chosen exactly?
+
+```{r, fig.height=7}
+genes.higlight <- c("SH2B3", "HLA-G", "PTPN11", "STAT3", "STAT5A", "STAT5B", "FUT11", "TSLP", "MAPKAPK5", "TRIM31", "TRAFD1")
+alltrait.vs.egene <- comb.csqtls %>% group_by(Gene, PhenoPretty, ident) %>% summarise("NCount"=n())
+alltrait.vs.egene$CT.Col <- ifelse(alltrait.vs.egene$ident == "CD8_T", pal_npg()(2)[1], pal_npg()(2)[2])
+
+alltrait.vs.egene$Gene.Fac <- factor(alltrait.vs.egene$Gene,
+                                        levels=unique(alltrait.vs.egene$Gene)[rev(order(unique(alltrait.vs.egene$Gene, decreasing=TRUE)))])
+
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+# create gene labels to colour the x-axis
+ct.cols <- glue_data(
+  alltrait.vs.egene, 
+  "<span style='color: {if_else(ident=='CD8_T', ct_cols['CD8_T'], ct_cols['monocytes'])}'>{Gene.Fac}</span>"
+  )
+names(ct.cols) <- alltrait.vs.egene$Gene.Fac
+
+ggplot(alltrait.vs.egene[alltrait.vs.egene$Gene %in% genes.higlight, ], 
+       aes(y=Gene.Fac, x=PhenoPretty, fill=NCount)) +
+  geom_tile() +
+  theme_cowplot() +
+  # scale_fill_distiller(palette="YlOrRd", direction=1, breaks=seq(1, 3, 1)) +
+  scale_fill_scico(palette="berlin") +
+  scale_y_discrete(labels=ct.cols, breaks=alltrait.vs.egene$Gene.Fac) +
+  theme(axis.text.y=element_markdown(size=14, family="Roboto"),
+        axis.text.x=element_text(angle=90, vjust=0.5, hjust=1, size=16),
+        text=element_text(family="Roboto"),
+        title=element_text(family="Roboto", size=18)) +
+
+  guides(fill=guide_colorbar(title="#Nhoods")) +
+  labs(x="Trait", y="eGene") +
+  NULL
+
+# ggsave("~/Dropbox/GLMM/plots/ColocTraits_vs_Genes-allImmune.png",
+#        height=4.5, width=16, dpi=600, bg='white')
+# 
+# ggsave("~/Dropbox/GLMM/plots/ColocTraits_vs_Genes-allImmune.svg",
+#        height=28, width=16, dpi=600, bg='white')
+
+```
+
+# High-resolution locus zoom plots
+
+To illustrate the colocalisation between csQTLs, immune system traits and csQTLs it is helpful to plot the high-resolution (locusZoom) Manhattan plots of these regions.
+
+## 2_18690591_C_T
+
+```{r}
+# do we want a locus zoom plot here?
+suppressMessages({
+library(locuszoomr)
+library(EnsDb.Hsapiens.v75)
+})
+
+gwas.dir <- "~/Dropbox/GLMM/locus.dir/"
+gwas.files <- list.files(gwas.dir, pattern="\\.gz$", full.names=TRUE, recursive=TRUE, include.dirs=TRUE)
+
+l.window <- 500000L
+# grab some example csQTL results
+soi.qtl <- c("2_18690591_C_T") # SNP of interest
+nhoi <- c(636)
+soi.file <- gwas.files[grepl(gwas.files, pattern=soi.qtl)]
+
+x.chr <- gsub(soi.qtl, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1")
+x.bp <- as.numeric(gsub(soi.qtl, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+
+# tabix this for speed
+x.tab.query <- paste0("tabix ", soi.file, " ", paste0(x.chr, ":", x.bp-l.window, "-", x.bp+l.window))
+x.df <- do.call(rbind.data.frame, lapply(system(x.tab.query, intern=TRUE), FUN=function(TX){
+  unlist(strsplit(TX, split="\t", fixed=TRUE))
+  }))
+
+colnames(x.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+x.df$CHR <- as.numeric(x.df$CHR)
+x.df$BP <- as.numeric(x.df$BP)
+x.df$logFC <- as.numeric(x.df$logFC)
+x.df$SE <- as.numeric(x.df$SE)
+x.df$GeneticVariance <- as.numeric(x.df$GeneticVariance)
+x.df$SpatialFDR <- as.numeric(x.df$SpatialFDR)
+x.df$Nhood <- as.numeric(x.df$Nhood)
+
+x.df <- x.df[x.df$Nhood %in% nhoi, ]
+```
+
+
+```{r, fig.height=4, fig.width=8}
+x.min <- min(x.df$BP - 10)
+x.max <- max(x.df$BP + 10)
+rdh14.loc <- locus(x.df, xrange=c(x.min, x.max), seqname=x.chr, p="SpatialFDR", LD=FALSE, index_snp=soi.qtl)
+
+png("~/Dropbox/GLMM/plots/LocusZoom_RDH14-2_18690591_C_T_csQTL.png", height=4, width=8, res=300, units="in")
+plot(rdh14.loc, ylab=expression("-log"[10]~"Spatial FDR"), cex.axis=1)
+dev.off()
+
+plot(rdh14.loc, ylab=expression("-log"[10]~"Spatial FDR"), cex.axis=1)
+```
+
+Do the same for the FUT11 and all other eQTLs at this locus now.
+
+### RDH14
+
+```{r}
+matrix.eqtl.df <- read.table("~/Dropbox/GLMM/results/MatrixEQTL_results-csQTLs.tsv",
+                             sep="\t", header=TRUE, stringsAsFactors=FALSE)
+rdh14.qtl.df <- matrix.eqtl.df[matrix.eqtl.df$gene %in% c("RDH14"), ]
+rdh14.qtl.df$chrom <- as.numeric(gsub(rdh14.qtl.df$snps, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1"))
+rdh14.qtl.df$pos <- as.numeric(gsub(rdh14.qtl.df$snps, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+```
+
+
+
+```{r, fig.height=4, fig.width=8}
+rdh14.eqtl.loc <- locus(rdh14.qtl.df[rdh14.qtl.df$Nhood %in% nhoi & rdh14.qtl.df$LeadSNP %in% soi.qtl, ], 
+                        xrange=c(x.min, x.max), seqname=x.chr, p="FDR", LD=FALSE, labs="snps", index_snp=soi.qtl)
+
+png("~/Dropbox/GLMM/plots/LocusZoom_RDH14-2_18690591_C_T_MatrixeQTL.png", height=4, width=8, res=300, units="in")
+plot(rdh14.eqtl.loc, pcutoff=1e-2, ylab=expression("-log"[10]~"FDR"), cex.axis=1)
+dev.off()
+
+plot(rdh14.eqtl.loc, pcutoff=1e-2, ylab=expression("-log"[10]~"FDR"), cex.axis=1)
+```
+
+We also need the summary stats from the example immune traits for this locus. I'll use bacterial enteritis as the example.
+
+```{r}
+trait.file <- "~/Dropbox/GLMM/panUKBB/finngen_R9_AB1_MUMPS.gz"
+
+# tabix this for speed
+trait.tab.query <- paste0("tabix ", trait.file, " ", paste0(x.chr, ":", x.bp-l.window, "-", x.bp+l.window))
+trait.df <- do.call(rbind.data.frame, lapply(system(trait.tab.query, intern=TRUE), FUN=function(TX){
+  unlist(strsplit(TX, split="\t", fixed=TRUE))
+  }))
+colnames(trait.df) <- colnames(readr::read_tsv(trait.file, n_max=1, show_col_types=FALSE))
+trait.df$CHR <- as.numeric(trait.df$`#chrom`)
+trait.df$SNP <- paste(trait.df$CHR, trait.df$pos, trait.df$ref, trait.df$alt, sep="_") # note that ref and alt might not be identical
+trait.df$BP <- as.numeric(trait.df$pos)
+trait.df$mlogp <- as.numeric(trait.df$mlogp)
+trait.df$beta <- as.numeric(trait.df$beta)
+trait.df$sebeta <- as.numeric(trait.df$sebeta)
+trait.df$varbeta <- (trait.df$sebeta)**2
+
+# reverse engineer the p-values
+trait.df$P <- 10**(-trait.df$mlogp)
+# trait.df$P <- pnorm(-abs(trait.df$beta_meta/sqrt(trait.df$varbeta)))*2 
+trait.df <- na.omit(trait.df)
+```
+
+
+```{r, fig.height=4, fig.width=8}
+trait.loc <- locus(trait.df, xrange=c(x.min, x.max),pos="BP", seqname=x.chr, p="P", LD=FALSE, labs="SNP", index_snp=soi.qtl)
+
+png("~/Dropbox/GLMM/plots/LocusZoom_RDH14-2_18690591_C_T_Mumps.png", height=4, width=8, res=300, units="in")
+plot(trait.loc, pcutoff=1e-4, ylab=expression("-log"[10]~"p-value"), cex.axis=1)
+dev.off()
+
+plot(trait.loc, pcutoff=1e-4, ylab=expression("-log"[10]~"p-value"), cex.axis=1)
+```
+
+Plot the lead SNPs for the csQTL, alopecia and these eQTLs to identify concordant directions of effect.
+
+
+```{r}
+overlapping.snps <- intersect(intersect(trait.df$SNP, x.df$SNP), 
+                              unique(matrix.eqtl.df[matrix.eqtl.df$gene %in% alltrait.vs.egene[grepl(alltrait.vs.egene$PhenoPretty, pattern="mumps"), ]$Gene, ]$snps))
+soi.qtl %in% overlapping.snps
+```
+
+I can just plot the effect sizes for the csQTL SNP.
+
+```{r}
+soi.eqtl.stats <- matrix.eqtl.df[matrix.eqtl.df$gene %in% alltrait.vs.egene[grepl(alltrait.vs.egene$PhenoPretty, pattern="mumps"), ]$Gene &
+                                   matrix.eqtl.df$snps %in% soi.qtl & matrix.eqtl.df$Nhood %in% nhoi, ]
+soi.trait.stats <- trait.df[trait.df$SNP %in% soi.qtl, , drop=FALSE]
+soi.csqtl.stats <- x.df[x.df$SNP %in% soi.qtl, , drop=FALSE]
+
+soi.stat.df <- do.call(rbind.data.frame,
+                       list(data.frame("SNP"=soi.qtl, "Beta"=soi.eqtl.stats$beta, "SEBETA"=abs(soi.eqtl.stats$beta/soi.eqtl.stats$statistic), "Trait"=soi.eqtl.stats$gene, "Type"="Gene"),
+                            data.frame("SNP"=soi.qtl, "Beta"=soi.csqtl.stats$logFC, "SEBETA"=soi.csqtl.stats$SE, "Trait"=paste0("Nh:",soi.csqtl.stats$Nhood), "Type"="CellState"),
+                            data.frame("SNP"=soi.qtl, "Beta"=soi.trait.stats$beta, "SEBETA"=soi.trait.stats$sebeta, "Trait"="Mumps(FinnGen)", "Type"="Disease")))
+
+soi.stat.df$Type <- factor(soi.stat.df$Type,
+                           levels=c("CellState", "Disease", "Gene"))
+```
+
+
+```{r, fig.height=3, fig.width=5.5}
+y.max <- max(abs(soi.stat.df$Beta+soi.stat.df$SEBETA))
+y.eps <- y.max * 0.1
+
+soi.stat.df <- soi.stat.df[order(as.numeric(soi.stat.df$Type), decreasing = FALSE), ]
+
+ggplot(soi.stat.df, aes(x=reorder(Trait, -as.numeric(Type)), y=Beta, colour=Type)) +
+  geom_point(size=2.5) +
+  geom_errorbar(aes(ymin=Beta-SEBETA, ymax=Beta+SEBETA), width=0.25) +
+  geom_hline(yintercept=0, lty=2, colour='grey80') +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto"),
+        axis.text.x = element_text(angle=90, vjust=0.5, hjust=1)) +
+  scale_y_continuous(limits=c(-y.max-y.eps, y.max+y.eps)) +
+  labs(x="Trait", y="Effect size (log)") +
+  scale_color_cosmic() +
+  coord_flip() +
+  NULL
+```
+
+This demonstrates that the genetic locus _susceptible_ for Mumps leads to increase CD8 T cell state represented by Nhood 636 and lower expression of a whole 
+suite of genes in this cell state. I'll generate boxplots and UMAPs of these relevant genes as well for reference, e.g. are they ubiquitously or specifically expressed?
+
+```{r}
+# plots of gene expression across all nhoods (i.e. on the UMAP)
+# and by csQTL Lead SNP genotype (i.e. boxplots)
+# add the expression of these genes to the colData
+gene.goi <- as.data.frame(as.matrix(t(logcounts(rand.ni.milo[rownames(rand.ni.milo) %in% soi.eqtl.stats$gene, ]))))
+rownames(gene.goi) <- colnames(rand.ni.milo)
+
+for(k in seq_along(colnames(gene.goi))){
+  k.gene <- colnames(gene.goi)[k]
+  colData(rand.ni.milo)[, k.gene] <- gene.goi[, k.gene]
+}
+```
+
+
+## 12_111636112_A_G
+
+```{r}
+# do we want a locus zoom plot here?
+suppressMessages({
+library(locuszoomr)
+library(EnsDb.Hsapiens.v75)
+})
+
+gwas.dir <- "~/Dropbox/GLMM/locus.dir/"
+gwas.files <- list.files(gwas.dir, pattern="\\.gz$", full.names=TRUE, recursive=TRUE, include.dirs=TRUE)
+
+l.window <- 500000L
+# grab some example csQTL results
+soi.qtl <- c("12_111636112_A_G") # SNP of interest
+nhoi <- c(3151)
+soi.file <- gwas.files[grepl(gwas.files, pattern=soi.qtl)]
+
+x.chr <- gsub(soi.qtl, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1")
+x.bp <- as.numeric(gsub(soi.qtl, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+
+# tabix this for speed
+x.tab.query <- paste0("tabix ", soi.file, " ", paste0(x.chr, ":", x.bp-l.window, "-", x.bp+l.window))
+x.df <- do.call(rbind.data.frame, lapply(system(x.tab.query, intern=TRUE), FUN=function(TX){
+  unlist(strsplit(TX, split="\t", fixed=TRUE))
+  }))
+
+colnames(x.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+x.df$CHR <- as.numeric(x.df$CHR)
+x.df$BP <- as.numeric(x.df$BP)
+x.df$logFC <- as.numeric(x.df$logFC)
+x.df$SE <- as.numeric(x.df$SE)
+x.df$GeneticVariance <- as.numeric(x.df$GeneticVariance)
+x.df$SpatialFDR <- as.numeric(x.df$SpatialFDR)
+x.df$Nhood <- as.numeric(x.df$Nhood)
+
+x.df <- x.df[x.df$Nhood %in% nhoi, ]
+```
+
+
+```{r, fig.height=4, fig.width=8}
+x.min <- min(x.df$BP - 10)
+x.max <- max(x.df$BP + 10)
+sh2b3.loc <- locus(x.df, xrange=c(x.min, x.max), seqname=x.chr, p="SpatialFDR", LD=FALSE, index_snp=soi.qtl)
+
+png("~/Dropbox/GLMM/plots/LocusZoom_SH2B3-12_111636112_A_G_csQTL.png", height=4, width=8, res=300, units="in")
+plot(sh2b3.loc, ylab=expression("-log"[10]~"Spatial FDR"), cex.axis=1)
+dev.off()
+
+plot(sh2b3.loc, ylab=expression("-log"[10]~"Spatial FDR"), cex.axis=1)
+```
+
+Do the same for the SH2B3 eQTL now.
+
+```{r}
+sh2b3.qtl.df <- matrix.eqtl.df[matrix.eqtl.df$gene %in% c("SH2B3"), ]
+sh2b3.qtl.df$chrom <- as.numeric(gsub(sh2b3.qtl.df$snps, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1"))
+sh2b3.qtl.df$pos <- as.numeric(gsub(sh2b3.qtl.df$snps, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+```
+
+
+
+```{r, fig.height=4, fig.width=8}
+sh2b3.eqtl.loc <- locus(sh2b3.qtl.df[sh2b3.qtl.df$Nhood %in% nhoi & sh2b3.qtl.df$LeadSNP %in% soi.qtl, ], 
+                        xrange=c(x.min, x.max), seqname=x.chr, p="FDR", LD=FALSE, labs="snps", index_snp=soi.qtl)
+
+png("~/Dropbox/GLMM/plots/LocusZoom_SH2B3-12_111636112_A_G_MatrixeQTL.png", height=4, width=8, res=300, units="in")
+plot(sh2b3.eqtl.loc, pcutoff=1e-2, ylab=expression("-log"[10]~"FDR"), cex.axis=1)
+dev.off()
+
+plot(sh2b3.eqtl.loc, pcutoff=1e-2, ylab=expression("-log"[10]~"FDR"), cex.axis=1)
+```
+
+We also need the summary stats from the example immune traits for this locus. I'll use the systemic connective tissue disease as an example.
+
+```{r}
+library(rtracklayer)
+library(GenomicRanges)
+trait.file <- "~/Dropbox/GLMM/panUKBB/finngen_R9_M13_SYSTCONNECT.gz"
+# hg19tohg38.chain <- import.chain("~/Dropbox/GLMM/panUKBB/hg19ToHg38.over.chain")
+# hg38tohg19.chain <- import.chain("~/Dropbox/GLMM/panUKBB/hg38ToHg19.over.chain")
+
+# need to convert lead snp position to GRCh37 and final coordinates back to GRCh38
+
+# x.lift <- as.data.frame(liftOver(GRanges(seqnames=paste0("chr", x.chr), ranges=IRanges(start=x.bp, end=x.bp)), hg38tohg19.chain))
+# x.lift.bp <- x.lift$start
+
+# tabix this for speed
+trait.tab.query <- paste0("tabix ", trait.file, " ", paste0(x.chr, ":", x.bp-l.window, "-", x.bp+l.window))
+trait.df <- do.call(rbind.data.frame, lapply(system(trait.tab.query, intern=TRUE), FUN=function(TX){
+  unlist(strsplit(TX, split="\t", fixed=TRUE))
+  }))
+colnames(trait.df) <- colnames(readr::read_tsv(trait.file, n_max=1, show_col_types=FALSE))
+trait.df$CHR <- as.numeric(trait.df$`#chrom`)
+trait.df$SNP <- paste(trait.df$CHR, trait.df$pos, trait.df$ref, trait.df$alt, sep="_") # note that ref and alt might not be identical
+trait.df$BP <- as.numeric(trait.df$pos)
+trait.df$mlogp <- as.numeric(trait.df$mlogp)
+trait.df$beta <- as.numeric(trait.df$beta)
+trait.df$sebeta <- as.numeric(trait.df$sebeta)
+trait.df$varbeta <- (trait.df$sebeta)**2
+
+
+# reverse engineer the p-values
+trait.df$P <- 10**(-trait.df$mlogp)
+# trait.df$P <- pnorm(-abs(trait.df$beta_meta/sqrt(trait.df$varbeta)))*2 
+trait.df <- na.omit(trait.df)
+```
+
+
+```{r, fig.height=4, fig.width=8}
+trait.loc <- locus(trait.df, xrange=c(x.min, x.max),pos="BP", seqname=x.chr, p="P", LD=FALSE, labs="SNP", index_snp=soi.qtl)
+
+png("~/Dropbox/GLMM/plots/LocusZoom_SH2B3-12_111636112_A_G_M13_ConnectiveTissueDisease.png", height=4, width=8, res=300, units="in")
+plot(trait.loc, pcutoff=1e-6, ylab=expression("-log"[10]~"p-value"), cex.axis=1)
+dev.off()
+
+plot(trait.loc, pcutoff=1e-6, ylab=expression("-log"[10]~"p-value"), cex.axis=1)
+```
+
+```{r}
+overlapping.snps <- intersect(intersect(trait.df$SNP, x.df$SNP), 
+                              unique(matrix.eqtl.df[matrix.eqtl.df$gene %in% alltrait.vs.egene[grepl(alltrait.vs.egene$PhenoPretty, pattern="M13_systconnect"), ]$Gene, ]$snps))
+soi.qtl %in% overlapping.snps
+```
+
+I can just plot the effect sizes for the csQTL SNP.
+
+```{r}
+soi.eqtl.stats <- matrix.eqtl.df[matrix.eqtl.df$gene %in% alltrait.vs.egene[grepl(alltrait.vs.egene$PhenoPretty, pattern="M13_systconnect"), ]$Gene &
+                                   matrix.eqtl.df$snps %in% soi.qtl & matrix.eqtl.df$Nhood %in% nhoi, ]
+soi.trait.stats <- trait.df[trait.df$SNP %in% soi.qtl, , drop=FALSE]
+soi.csqtl.stats <- x.df[x.df$SNP %in% soi.qtl, , drop=FALSE]
+
+soi.stat.df <- do.call(rbind.data.frame,
+                       list(data.frame("SNP"=soi.qtl, "Beta"=soi.eqtl.stats$beta[soi.eqtl.stats$gene %in% c("SH2B3")],
+                                       "SEBETA"=abs(soi.eqtl.stats$beta[soi.eqtl.stats$gene %in% c("SH2B3")]/soi.eqtl.stats$statistic[soi.eqtl.stats$gene %in% c("SH2B3")]), 
+                                       "Trait"=soi.eqtl.stats$gene[soi.eqtl.stats$gene %in% c("SH2B3")], "Type"="Gene"),
+                            data.frame("SNP"=soi.qtl, "Beta"=soi.csqtl.stats$logFC, "SEBETA"=soi.csqtl.stats$SE, "Trait"=paste0("Nh:",soi.csqtl.stats$Nhood), "Type"="CellState"),
+                            data.frame("SNP"=soi.qtl, "Beta"=soi.trait.stats$beta, "SEBETA"=soi.trait.stats$sebeta, "Trait"="Connective Tissue Disease(FinnGen)", "Type"="Disease")))
+
+soi.stat.df$Type <- factor(soi.stat.df$Type,
+                           levels=c("CellState", "Disease", "Gene"))
+```
+
+
+```{r, fig.height=3, fig.width=5.5}
+y.max <- max(abs(soi.stat.df$Beta+soi.stat.df$SEBETA))
+y.eps <- y.max * 0.1
+
+soi.stat.df <- soi.stat.df[order(as.numeric(soi.stat.df$Type), decreasing = FALSE), ]
+
+ggplot(soi.stat.df, 
+       aes(x=reorder(Trait, -as.numeric(Type)), y=Beta, colour=Type)) +
+  geom_point(size=2.5) +
+  geom_errorbar(aes(ymin=Beta-SEBETA, ymax=Beta+SEBETA), width=0.25) +
+  geom_hline(yintercept=0, lty=2, colour='grey80') +
+  theme_cowplot() +
+  theme(text=element_text(family="Roboto"),
+        axis.text.x = element_text(angle=90, vjust=0.5, hjust=1)) +
+  scale_y_continuous(limits=c(-y.max-y.eps, y.max+y.eps)) +
+  labs(x="Trait", y="Effect size (log)") +
+  scale_color_cosmic() +
+  coord_flip() +
+  NULL
+
+ggsave("~/Dropbox/GLMM/plots/EffectSizes_ConnectiveTissueDisease-SH2B3-Nh3151.png",
+       height=3, width=5.5, dpi=300, bg='white')
+```
+
+This demonstrates that the genetic locus _protective_ for Alopecia leads to increase CD8 T cell state represented by Nhood 636 and lower expression of a whole 
+suite of genes in this cell state. I'll generate boxplots and UMAPs of these relevant genes as well for reference, e.g. are they ubiquitously or specifically expressed?
+
+```{r}
+# plots of gene expression across all nhoods (i.e. on the UMAP)
+# and by csQTL Lead SNP genotype (i.e. boxplots)
+# add the expression of these genes to the colData
+gene.goi <- as.data.frame(as.matrix(t(logcounts(rand.ni.milo[rownames(rand.ni.milo) %in% soi.eqtl.stats$gene, ]))))
+rownames(gene.goi) <- colnames(rand.ni.milo)
+
+for(k in seq_along(colnames(gene.goi))){
+  k.gene <- colnames(gene.goi)[k]
+  colData(rand.ni.milo)[, k.gene] <- gene.goi[, k.gene]
+}
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+all.goi <- soi.eqtl.stats$gene
+
+for(q in seq_along(all.goi)){
+  q.gene <- all.goi[q]
+  
+  if(q.gene %in% colnames(colData(rand.ni.milo))){
+      p.plot <- plotNhoodGraph(rand.ni.milo, layout="UMAP", colour_by=q.gene) +
+          scale_fill_viridis(option="plasma") +
+          guides(fill=guide_colorbar(title=q.gene)) +
+          NULL
+      
+      p.file <- paste0("~/Dropbox/GLMM/plots/RandolphUMAPs/Randolph_GWAS-", q.gene, "_NhoodUMAP.png")
+      ggsave(plot=p.plot, filename=p.file, height=4.5, width=6.5, dpi=300)
+      
+      # single-cell UMAP?
+      p.df <- cbind.data.frame(rand.ni.meta, colData(rand.ni.milo)[, c(q.gene), drop=FALSE])
+      p.df <- p.df[, c("UMAP1", "UMAP2", q.gene), drop=FALSE]
+      colnames(p.df) <- c("UMAP1", "UMAP2", "Gene")
+    
+      p.sc.plot <- ggplot(p.df, aes(x=UMAP1, y=UMAP2)) +
+        geom_point_rast(data=p.df[p.df$Gene == 0, ], colour='grey80', raster.dpi=300) +
+        geom_point_rast(data=p.df[p.df$Gene > 0, ], mapping=aes(colour=Gene), raster.dpi=300) +
+        theme_cowplot() +
+        scale_colour_viridis(option="plasma") +
+        guides(colour=guide_colorbar(title=q.gene)) +
+        NULL
+      
+      p.file <- paste0("~/Dropbox/GLMM/plots/RandolphUMAPs/Randolph_GWAS-", q.gene, "_scUMAP.png")
+      ggsave(plot=p.sc.plot, filename=p.file, height=4.5, width=6.5, dpi=300, bg='white')
+  }
+}
+```
+
+I will also overlay the eQTL and csQTL lead SNP effect sizes on these UMAPs to show the correspondence between expression and genetic effects. We also want to visualise the relationship between 
+expression and genotype for each of these eGenes and the lead csQTL SNPs.
+
+```{r, warning=FALSE, message=FALSE, fig.height=3, fig.width=2.5}
+ct_cols <- colorRampPalette(pal_npg()(10))(length(unique(rand.ni.meta$ident)))
+names(ct_cols) <- unique(rand.ni.meta$ident)
+
+for(q in seq_along(all.goi)){
+  q.gene <- all.goi[q]
+  
+  # retrieve the lead SNPs
+  q.snp <- unique(csqtl.eqtl.coloc.df$LeadSNP[csqtl.eqtl.coloc.df$Gene %in% q.gene])
+  
+  for(k in seq_along(q.snp)){
+    k.snp <- q.snp[k]
+    
+    # extract the eQTL summary statistics for this gene
+    q.eqtl <- matrix.eqtl.df[matrix.eqtl.df$snps %in% k.snp & matrix.eqtl.df$gene %in% q.gene, ]
+    
+    q.file <- gwas.files[grepl(gwas.files, pattern=k.snp)]
+    q.lead <- gsub(q.file, pattern="([[:ascii:]]*)/(chr[0-9]+)/([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)(_locus\\.tsv\\.gz)", 
+                   replacement="\\3_\\4_\\5_\\6", perl=TRUE)
+    q.chr <- gsub(k.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\1")
+    q.bp <- as.numeric(gsub(k.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\2"))
+    
+    # tabix this for speed
+    q.tab.query <- paste0("tabix ", q.file, " ", paste0(q.chr, ":", q.bp-10, "-", q.bp+10))
+    q.df <- do.call(rbind.data.frame, lapply(system(q.tab.query, intern=TRUE), FUN=function(TX){
+      unlist(strsplit(TX, split="\t", fixed=TRUE))
+    }))
+    
+    colnames(q.df) <- c("SNP", "BP", "CHR", "logFC", "SE", "GeneticVariance", "SpatialFDR", "Nhood", "ALT", "REF")
+    q.df$CHR <- as.numeric(q.df$CHR)
+    q.df$BP <- as.numeric(q.df$BP)
+    q.df$logFC <- as.numeric(q.df$logFC)
+    q.df$SE <- as.numeric(q.df$SE)
+    q.df$GeneticVariance <- as.numeric(q.df$GeneticVariance)
+    q.df$SpatialFDR <- as.numeric(q.df$SpatialFDR)
+    q.df$Nhood <- as.numeric(q.df$Nhood)
+    
+    # add csQTL results to nhoods 
+    q.plot <- plotNhoodGraphDA(rand.ni.milo, q.df, res_column = "logFC")
+    qu.file <- paste0("~/Dropbox/GLMM/plots/RandolphcsQTLUMAP/RandolphGWAS-", k.snp, "_logFC-NhoodUMAP.png")
+    ggsave(plot=q.plot, filename=qu.file, height=4.5, width=6.5, dpi=300)
+    
+    # plot genotypes vs gene expression
+    ###--- genotype data ---### 
+    q.geno <- read.table(paste0("~/Dropbox/GLMM/subset_genotype.dir/", k.snp, ".traw"),
+                            header=TRUE, stringsAsFactors=FALSE, sep="\t")
+    colnames(q.geno) <- gsub(colnames(q.geno), pattern="(\\S+)_(\\S+)", replacement="\\1")
+    q.geno <- q.geno[q.geno$SNP %in% k.snp, !colnames(q.geno) %in% c("CHR", "X.C.M", "POS", "COUNTED", "ALT")]
+    q.nhoods <- na.omit(csqtl.eqtl.coloc.df$Nhood[csqtl.eqtl.coloc.df$Gene %in% q.gene & csqtl.eqtl.coloc.df$LeadSNP %in% k.snp]) 
+    
+    for(i in seq_along(q.nhoods)){
+      i.nh <- q.nhoods[i]
+      q.cellxsamp <- model.matrix(~0+SOC_indiv_ID, data=colData(rand.ni.milo))
+      colnames(q.cellxsamp) <- gsub(colnames(q.cellxsamp), pattern="SOC_indiv_ID", replacement="")
+      q.cellxsamp <- q.cellxsamp[, colnames(q.cellxsamp) %in% colnames(q.geno)]
+      
+      q.idx <- as.character(nhoodIndex(rand.ni.milo)[[i.nh]])
+      q.cellxnh <- nhoods(rand.ni.milo)[, q.idx, drop=FALSE]
+      q.cells <- rownames(q.cellxnh)[rowSums(q.cellxnh) > 0]
+      q.cellxsamp <- q.cellxsamp[q.cells, , drop=FALSE]
+      q.csums <- colSums(q.cellxsamp)
+      
+      q.ps <- counts(rand.ni.milo[rownames(rand.ni.milo) %in% q.gene, q.cells, drop=FALSE]) %*% q.cellxsamp
+      q.ps <- t(apply(q.ps, 1, FUN=function(GX) log((GX+1)/(q.csums+1))))
+      q.ps[is.na(q.ps)] <- 0
+      q.ps <- do.call(cbind.data.frame, list("Genes"=rownames(q.ps), q.ps))
+      rownames(q.ps) <- NULL
+      
+      q.snames <- intersect(colnames(q.ps), colnames(q.geno))
+      q.gene.vis <- as.data.frame(t(do.call(rbind.data.frame, list("Gene"=q.ps[,q.snames], "SNP"=q.geno[, q.snames]))))
+      q.gene.vis$SNP <- as.factor(q.gene.vis$SNP)
+      q.gene.vis <- na.omit(q.gene.vis)
+      
+      y.max <- max(q.gene.vis$Gene)
+      if(y.max == 0){
+        y.max.eps <- 0.1  
+      } else{
+        y.max.eps <- y.max * 0.1
+      }
+      
+      y.min <- min(q.gene.vis$Gene)
+      if(y.min == 0){
+        y.min.eps <- -0.1
+      } else{
+        y.min.eps <- y.min * 0.1  
+      }
+      
+      q.ident <- unique(csqtl.eqtl.coloc.df$ident[csqtl.eqtl.coloc.df$Nhood %in% i.nh])
+      q.col <- ct_cols[q.ident]
+      
+      q.box <- ggplot(q.gene.vis, aes(x=SNP, y=Gene)) +
+        geom_boxplot(notch=FALSE, fill=q.col, outlier.size=0.5) +
+        geom_jitter(width=0.1, shape=21, size=2, fill=darken(q.col)) +
+        theme_cowplot() +
+        labs(x=k.snp, y=paste("log ", q.gene, "\nexpression")) +
+        scale_y_continuous(limits=c(y.min-y.min.eps, y.max+y.max.eps)) +
+        theme(text=element_text(family="Roboto")) +
+        NULL
+    
+      qp.file <- paste0("~/Dropbox/GLMM/plots/RandolphQTLBoxplots/RandolphGWAS-", k.snp, "_", q.gene, "_", i.nh, "_boxplot.png")
+      ggsave(plot=q.box, file=qp.file, height=3, width=2.5, bg='white', dpi=300)
+    }
+  }
+}
+```
+
+
+
+

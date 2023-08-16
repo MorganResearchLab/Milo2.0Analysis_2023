@@ -1,0 +1,1005 @@
+---
+title: "Unrelated data simulator"
+output: html_notebook
+---
+
+I need to simulate unrelated individuals and their phenotypes to test the GLMM model without the kinship matrix.
+
+## Import statements
+
+```{r}
+library(Matrix)
+library(lme4)
+library(reshape2)
+library(ggplot2)
+library(cowplot)
+library(glmmTMB)
+library(miloR)
+library(ggsci)
+library(scales)
+library(dplyr)
+library(MASS)
+library(BiocParallel)
+library(tidyr)
+```
+
+## Simulation functions
+
+```{r}
+initializeFullZsim <- function(Z, cluster_levels, stand.cols=FALSE){
+    # construct the full Z with all random effect levels
+    n.cols <- ncol(Z)
+    col.classes <- apply(Z, 2, class)
+    i.z.list <- list()
+    for(i in seq_len(n.cols)){
+        i.class <- col.classes[i]
+        if(i.class %in% c("factor")){ # treat as factors
+            i.levels <- levels(Z[, i, drop=FALSE])
+            i.levels <- as.factor(paste(sort(as.integer(i.levels))))
+            i.z <- sapply(i.levels, FUN=function(X) (Z[, i] == X) + 0, simplify=TRUE)
+        } else if(i.class %in% c("character")){
+            i.levels <- unique(Z[, i, drop=FALSE])
+            i.levels <- as.factor(paste(sort(as.integer(i.levels))))
+            i.z <- sapply(i.levels, FUN=function(X) (Z[, i] == X) + 0, simplify=TRUE)
+        } else if(i.class %in% c("numeric")){ # split into unique levels if integer levels
+            i.mod <- all(Z[, i, drop=FALSE] %% 1 == 0)
+            if(isTRUE(i.mod)){
+                i.levels <- unique(Z[, i])
+                i.levels <- as.factor(paste(sort(as.integer(i.levels))))
+                i.z <- sapply(i.levels, FUN=function(X) (Z[, i] == X) + 0, simplify=TRUE)
+            } else{
+                i.z <- Z[, i, drop=FALSE] # if float then treat as continuous
+            }
+        } else if(i.class %in% c("integer")){
+            i.levels <- (unique(Z[, i]))
+            i.levels <- as.factor(paste(sort(as.integer(i.levels))))
+            i.z <- sapply(i.levels, FUN=function(X) (Z[, i] == X) + 0, simplify=TRUE)
+        }
+
+        colnames(i.z) <- cluster_levels[[colnames(Z)[i]]]
+        
+        # to standardise or not?
+        if(isTRUE(stand.cols)){
+            q <- ncol(i.z)
+            i.ident <- diag(1L, nrow=nrow(i.z), ncol=nrow(i.z))
+            i.star <- i.z - ((i.ident %*% i.z)/q)
+            i.z <- i.star
+        }
+        
+        i.z.list[[colnames(Z)[i]]] <- i.z
+    }
+    full.Z <- do.call(cbind, i.z.list)
+    return(full.Z)
+}
+
+
+SimulateData <- function(N, fe.betas, re.sigmas,
+                         dispersion, grand.mean, n.fe, n.re, 
+                         re.levels, fe.levels){
+    # create a per-level mean effect for each FE
+    if(length(fe.levels) != n.fe){
+        stop("List entries need to match number of input fixed effects")
+    }
+    
+    if(length(re.levels) != n.re){
+        stop("List entries need to match number of input random effects")
+    }
+    
+    # create the design matrices
+    X <- matrix(0L, ncol=n.fe+1, nrow=N)
+    X[, 1] <- 1
+    colnames(X) <- c("Intercept", names(fe.levels))
+    
+    Z <- matrix(0L, ncol=n.re, nrow=N)
+    
+    for(i in seq_len(n.fe)){
+        if(fe.levels[[i]] == 1){
+            X[, i+1] <- sapply(seq_len(N), FUN=function(B){
+                rnorm(1, mean=0, sd=1)
+                })
+        } else if(fe.levels[[i]] == 2){
+            X[, i+1] <- sapply(seq_len(N), FUN=function(B){
+                sample(c(0, 1), 1)
+                })
+            X[, i+1] <- as.factor(X[, i+1])
+        }else{
+            X[, i+1] <- sapply(seq_len(N), FUN=function(B){
+                sample(seq_len(fe.levels[[i]]), 1)
+                })
+            X[, i+1] <- as.factor(X[, i+1])
+        }
+    }
+    
+    # Make categorical effects 0 or 1 (not 1 or 2)
+    # X[,2] <- X[,2] - 1
+    
+    for(j in seq_len(n.re)){
+        if(re.levels[[j]] == 1){
+            Z[, j] <- sapply(seq_len, FUN=function(R){
+                rnorm(1, mean=1, sd=1)
+            })
+        } else{
+            Z[, j] <- sapply(seq_len(N), FUN=function(R){
+                sample(seq_len(re.levels[[j]]), 1)
+            })
+            Z[, j] <- factor(Z[, j], levels=c(1:re.levels[[j]]))
+        }
+    }
+    colnames(Z) <- names(re.levels)
+    
+    # construct the full Z
+    random.levels <- sapply(seq_len(length(re.levels)), FUN=function(RX) {
+        rx.name <- names(re.levels)[RX]
+        paste(rx.name, seq_len(re.levels[[rx.name]]), sep="_")
+        }, simplify=FALSE)
+    names(random.levels) <- names(re.levels)
+
+    # actual random.levels
+    r.levels <- lapply(names(random.levels), FUN=function(IX) unique(Z[, IX]))
+    names(r.levels) <- names(random.levels)
+    full.Z <- initializeFullZsim(Z, r.levels)
+    
+    # get a combination over random effects 
+    # and sample each level from the same ~Normal(0, sigma)
+    # note that the variance would be G if we also had random slopes
+    re.thetas <- list()
+    for(i in seq_len(length(re.levels))){
+        i.re <- names(r.levels[i])
+        i.levels <- length(r.levels[[i.re]])
+        i.re.means <- rnorm(n=i.levels, 0, sd=sqrt(re.sigmas[[i.re]])) # sample a random effect value
+        i.re.list <- sapply(seq_len(i.levels), FUN=function(X) i.re.means[X])
+        names(i.re.list) <- r.levels[[i.re]]
+        re.thetas[[i.re]] <- i.re.list
+    }
+    
+    B <- full.Z %*% unlist(re.thetas)
+
+    # map the fixed effects to mean values
+    betas <- c(grand.mean, unlist(fe.betas))
+    Beta <- X %*% betas
+
+    # construct the y.means equation, depending on desired distribution and FE/RE
+    # add the family correlation here?
+    y.means <- exp(Beta + B)
+    r <- mean(y.means)^2/(mean(y.means)^2/dispersion + 2*mean(y.means))
+    y.counts <- rnbinom(N, mu = y.means, size = dispersion)
+    y.counts[y.counts < 0] <- 0
+    y.counts <- floor(y.counts)
+    
+    Z <- as.data.frame(Z)
+    
+    sim.data <- data.frame("Mean"=y.means, "Mean.Count"=y.counts, "r"=r, "Indiv"=seq_len(nrow(X)))
+    sim.data <- do.call(cbind.data.frame, list(sim.data, X, Z))
+    # print(re.thetas)
+    
+    return(sim.data)
+}
+```
+
+I will generate a range of data sets that vary the fixed and random effect components for the benchmarking.
+
+```{r}
+# fix these, i.e. FE1 is binary and FE2 is continuous. RE1 has 5 levels and RE2 has 4 levels.
+fe.levels <- list("FE1"=2, "FE2"=1)
+re.levels <- list("RE1"=5, "RE2"=7)
+
+grand.mean <- 0.5
+
+fe1.betas <- c(rev(-seq(2, 12, by=4)/10), seq(2, 12, by=2)/10)
+fe2.betas <- c(1:10)/10
+re1.sigmas <- c(5:15)/10
+re2.sigmas <- c(5:15)/10
+g.sigmas <- c(5:15)/10
+
+dispersion <- seq(0.5, 2, by=0.25)
+```
+
+By having this wrapped up in a function I can replicate it multiple times to get a series of simulations. For each set of simulations I will fix all parametes except for one to 
+investigate how accurate the GLMM is.
+
+## FE variation benchmarking
+
+```{r}
+fe.data.list <- list()
+n.indiv <- 150
+
+for(i in seq_along(fe1.betas)){
+    for(j in seq_along(fe2.betas)){
+        k <- 1
+        l <- 1
+        q <- 1
+
+        fe.betas <- list("FE1"=fe1.betas[i], "FE2"=fe2.betas[j])
+        re.sigmas <- list("RE1"=re1.sigmas[k], "RE2"=re2.sigmas[l])
+        r.dispersion <- dispersion[q]
+        
+        # just simulate N individual - no need to loop over anything here
+        sim.df <- SimulateData(N=n.indiv, fe.betas=fe.betas, re.sigmas=re.sigmas, dispersion=r.dispersion,
+                               grand.mean=grand.mean, n.fe=length(fe.betas), n.re=length(re.sigmas), 
+                               re.levels=re.levels, fe.levels=fe.levels)
+        
+        sim.df$ID <- seq_len(nrow(sim.df))
+        sim.df$FE1 <- as.factor(sim.df$FE1)
+        sim.df$RE1 <- as.factor(sim.df$RE1)    
+        
+        sim.df$FE1BETA <- fe1.betas[i]
+        sim.df$FE2BETA <- fe2.betas[j]
+        sim.df$RE1SIGMA <- re1.sigmas[k]
+        sim.df$RE2SIGMA <- re2.sigmas[l]
+        sim.df$DISPERSION <- dispersion[q]
+       
+        fe.data.list[[paste(c(i, j, k, l, q), collapse="_")]] <- sim.df
+    }
+}
+
+```
+
+This takes quite a long time to simulate all of these different scenarios - in fact there are `r 10**6` possible ground truth data sets, so I will just vary 2 parameters at a time 
+and keep all other values fixed.
+
+For each data set I will run:
+
+* glmmTMB
+* MASS::glmmPQL
+* lme4::glmer
+
+```{r}
+runModel <- function(data.df, fe.var, re.var, glmm.model, ...){
+    # run each model with the input data and formula for benchmarking
+    if(glmm.model %in% c("Milo")){
+        set.seed(42)
+        
+        random.levels <- lapply(re.var, FUN=function(RX){
+            paste0(RX, unique(as.numeric(as.factor(data.df[, RX]))))
+        })
+        
+        names(random.levels) <- re.var
+
+        x.list <- list()
+        for(x in seq_along(fe.var)){
+            x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
+        }
+        x.list[["Intercept"]] <- rep(1, nrow(data.df))
+        X <- do.call(cbind, x.list)
+        X <- X[, c("Intercept", fe.var)]
+        colnames(X) <- c("Intercept", fe.var)
+        
+        z.list <- list()
+        for(q in seq_along(re.var)){
+            z.list[[re.var[q]]] <- data.df[, re.var[q]]
+        }
+        
+        Z <- do.call(cbind, z.list)
+        colnames(Z) <- re.var
+
+        y <- data.df$Mean.Count
+        dispersion <- unique(data.df$DISPERSION)
+        
+        # covariance between u's
+        glmm.control <- glmmControl.defaults()
+        glmm.control$theta.tol <- 1e-6
+        glmm.control$max.iter <- 50
+        
+        model.run <- fitGLMM(X=X, Z=Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                             glmm.control=glmm.control, dispersion=dispersion, solver="Fisher")
+        
+        model.coef <- c(model.run$FE, model.run$Sigma)
+        
+    } else if(glmm.model %in% c("glmmTMB")){
+        re.vars <- unlist(sapply(re.var, FUN=function(RX) sprintf("(1|%s)", RX), simplify=FALSE))
+        mod.form <- paste0("Mean.Count ~ ", paste(c(1, fe.var, re.vars), collapse=" + "))
+        model.run <- glmmTMB(as.formula(mod.form), data=data.df, family=nbinom2(link="log"), REML=FALSE, se=TRUE)
+        
+        model.coef <- c(coefficients(summary(model.run))$cond[, 1], unlist(lapply(summary(model.run)$varcor$cond, FUN=function(RX) RX[, 1])))
+    } else if(glmm.model %in% c("PQL")){
+        re.vars <- unlist(sapply(re.var, FUN=function(RX) sprintf("1|%s", RX), simplify=FALSE))
+        re.mod <- paste0(" ~ ",  paste(re.vars, collapse=" + "))
+        fe.mod <- paste0("Mean.Count ~ ", paste(c(1, fe.var), collapse=" + "))
+        
+        model.coef <- tryCatch({
+            suppressMessages({
+                model.run <- glmmPQL(as.formula(fe.mod), as.formula(re.mod), family=nbinom2(link="log"), data=data.df)
+                model.coef <- c(coefficients(summary(model.run))[, 1], as.numeric(VarCorr(model.run)[c(seq_along(re.var)), 1]))
+            })
+        }, error=function(err){
+            model.coef <- c(rep(NA, length(fe.var) +1), rep(NA, length(re.var)))
+        })
+
+    } else if(glmm.model %in% c("Milo-kin")){
+        set.seed(42)
+        random.levels <- list()
+        random.levels[[re.var]] <- paste0(re.var, unique(as.numeric(as.factor(data.df[, re.var]))))
+        
+        x.list <- list()
+        for(x in seq_along(fe.var)){
+            x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
+        }
+        x.list[["Intercept"]] <- rep(1, nrow(data.df))
+        X <- do.call(cbind, x.list)
+        X <- X[, c("Intercept", fe.var)]
+        colnames(X) <- c("Intercept", fe.var)
+        
+        gen.Z <- matrix(0L, ncol=nrow(data.df), nrow=nrow(data.df))
+        diag(gen.Z) <- 1
+        colnames(gen.Z) <- paste0("Genetic", data.df$ID)
+        random.levels <- list("Genetic"=paste0("Genetic", data.df$ID))
+        
+        y <- data.df$Mean.Count
+        dispersion <- unique(data.df$DISPERSION)
+        
+        glmm.control <- glmmControl.defaults()
+        glmm.control$theta.tol <- 1e-6
+        glmm.control$max.iter <- 50
+        
+        model.list <- fitGLMM(X=X, Z=gen.Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                              glmm.control=glmm.control, dispersion=dispersion, Kin=big.kin, geno.only=TRUE, solver="HE-NNLS")
+        model.coef <- c(model.list$FE, model.list$Sigma)
+    }
+    
+    if(all(is.na(model.coef))){
+        model.coef <- c(rep(NA, length(fe.var)+1), rep(NA, length(re.var)))
+    }
+    
+    names(model.coef) <- c("Intercept", fe.var, re.var)
+    return(model.coef)
+}
+
+```
+
+This is the basic function for running each model on each simulation.
+
+```{r, warning=FALSE}
+fe.benchmark.list <- sapply(seq_along(fe.data.list), FUN=function(iX, fe, re){
+    DX <- fe.data.list[[iX]]
+    milo.res <- runModel(DX, fe, re, "Milo")
+    tmb.res <- runModel(DX, fe, re, "glmmTMB")
+    pql.res <- runModel(DX, fe, re, "PQL")
+
+    all.res <- do.call(rbind.data.frame, list(milo.res, tmb.res, pql.res))
+    colnames(all.res) <- c("Intercept", fe, re)
+    all.res$Model <- c("Milo", "glmmTMB", "PQL")
+    all.res$FE1BETA <- unique(DX$FE1BETA)
+    all.res$FE2BETA <- unique(DX$FE2BETA)
+    all.res$RE1SIGMA <- unique(DX$RE1SIGMA)
+    all.res$RE2SIGMA <- unique(DX$RE2SIGMA)
+
+    # compute the absolute errors
+    all.res$FE1Error <- abs(all.res$FE1 - all.res$FE1BETA)
+    all.res$FE2Error <- abs(all.res$FE2 - all.res$FE2BETA)
+    all.res$RE1Error <- abs(all.res$RE1 - all.res$RE1SIGMA)
+    all.res$RE2Error <- abs(all.res$RE2 - all.res$RE2SIGMA)
+
+    return(all.res)
+}, simplify=FALSE, fe=c("FE1", "FE2"), re=c("RE1"))
+
+fe.bench.df <- do.call(rbind.data.frame, fe.benchmark.list)
+rownames(fe.bench.df) <- NULL
+```
+
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE2BETA %in% c(1.0), ], 
+       aes(x=ordered(FE1BETA), y=FE1Error, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x="Ground truth \u03b21", y=expression(paste("| ", widehat("\u03b21")," - \u03b21 |"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE1vary_FE2fix-Error.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+Aside from the kinship model - the other 3 models are extremely consistent with each other. There is a strange effect that the error increases with the magnitude of the ground 
+truth when FE2 is fixed at 1.0. Why is the kinship model error so much higher than the others? Is this an over or under-estimate?
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE2BETA %in% c(1.0), ], 
+       aes(x=ordered(FE1BETA), y=FE1, fill=Model, colour=Model)) +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x="Ground truth \u03b21", y=expression(widehat("\u03b21"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE1vary_FE2fix-estimate.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+In general the effect size is _under-estimated_ compared to the ground truth. In fact, for these simulations, the sign is also always negative for the estimate - curious. This might 
+be a problem with the simulation. Do we observe the same for FE2?
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
+       aes(x=ordered(FE2BETA), y=FE2Error, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x="Ground truth \u03b22", y=expression(paste("| ", widehat("\u03b22")," - \u03b22 |"))) +
+    # expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE2vary_FE1fix-Error.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+Aside from the kinship model - the other 3 models are extremely consistent with each other. There is a strange effect that the error increases with the magnitude of the ground 
+truth when FE2 is fixed at 1.0. Why is the kinship model error so much higher than the others? Is this an over or under-estimate?
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
+       aes(x=ordered(FE2BETA), y=FE2, fill=Model, colour=Model)) +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x="Ground truth \u03b22", y=expression(widehat("\u03b22"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE2vary_FE1fix-estimate.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+Now compare this to using the kinship matrix instead of the family ID.
+
+```{r, fig.height=6, fig.width=9}
+ggplot(fe.bench.df, aes(x=ordered(RE1SIGMA), y=RE1Error, fill=Model)) +
+    geom_bar(stat='identity', position='dodge') +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03c3"["1"]^{2})), y=expression(paste("| ", widehat("\u03c3"["1"]^{2})," - \u03c3"["1"]^{2}," |"))) +
+    facet_grid(FE1BETA~FE2BETA) +
+    # scale_y_continuous(limits=c(0, 5), oob=squish) +
+    NULL
+```
+
+This is very interesting - there are some instances where the estimated genetic variance is extremely close to the ground truth, but this depends on the value of the fixed effects. 
+I'll slice this to get a clearer picture.
+
+```{r, fig.height=6, fig.width=9}
+ggplot(fe.bench.df,
+       aes(x=ordered(FE2BETA), y=RE1Error, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), 
+         y=expression(paste("| ", widehat("\u03c3"["1"]^{2})," - \u03c3"["1"]^{2}," |"))) +
+    facet_wrap(~FE1BETA) +
+    scale_y_continuous(limits=c(0, 1), oob=squish) +
+    NULL
+```
+
+
+```{r, fig.height=6, fig.width=9}
+ggplot(fe.bench.df,
+       aes(x=ordered(FE2BETA), y=RE1, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), 
+         y=expression(paste(widehat("\u03c3"["1"]^{2})))) +
+    facet_wrap(~FE1BETA) +
+    # scale_y_continuous(limits=c(0, 5), oob=squish) +
+    NULL
+```
+
+The ground truth variance estimate is 0.5 - most models do fairly well.
+
+## RE variation benchmarking
+
+```{r}
+re.data.list <- list()
+
+for(k in seq_along(re1.sigmas)){
+    for(l in seq_along(re2.sigmas)){
+    
+        i <- 1
+        j <- length(fe2.betas)
+        q <- 1
+
+        fe.betas <- list("FE1"=fe1.betas[i], "FE2"=fe2.betas[j])
+        re.sigmas <- list("RE1"=re1.sigmas[k], "RE2"=re2.sigmas[l])
+        
+        r.dispersion <- dispersion[q]
+        
+        # set.seed(42)
+        # just simulate N individual - no need to loop over anything here
+        sim.df <- SimulateData(N=n.indiv, fe.betas=fe.betas, re.sigmas=re.sigmas, dispersion=r.dispersion,
+                               grand.mean=grand.mean, n.fe=length(fe.betas), n.re=length(re.sigmas), 
+                               re.levels=re.levels, fe.levels=fe.levels)
+        
+        sim.df$ID <- seq_len(nrow(sim.df))
+        sim.df$FE1 <- as.factor(sim.df$FE1)
+        sim.df$RE1 <- as.factor(sim.df$RE1)    
+        
+        sim.df$FE1BETA <- fe1.betas[i]
+        sim.df$FE2BETA <- fe2.betas[j]
+        sim.df$RE1SIGMA <- re1.sigmas[k]
+        sim.df$RE2SIGMA <- re2.sigmas[l]
+        sim.df$DISPERSION <- dispersion[q]
+        sim.df$NZEROS <- sum(sim.df$Mean.Count == 0)
+        
+         re.data.list[[paste(c(i, j, k, l, q), collapse="_")]] <- sim.df
+    }
+}
+
+```
+
+
+```{r, warning=FALSE}
+sigma.benchmark.list <- sapply(seq_along(re.data.list), FUN=function(iX, fe, re){
+    DX <- re.data.list[[iX]]
+    milo.res <- runModel(DX, fe, re, "Milo")
+    tmb.res <- runModel(DX, fe, re, "glmmTMB")
+    pql.res <- runModel(DX, fe, re, "PQL")
+
+    all.res <- do.call(rbind.data.frame, list(milo.res, tmb.res, pql.res))
+    colnames(all.res) <- c("Intercept", fe, re)
+    all.res$Model <- c("Milo", "glmmTMB", "PQL")
+    all.res$FE1BETA <- unique(DX$FE1BETA)
+    all.res$FE2BETA <- unique(DX$FE2BETA)
+    all.res$RE1SIGMA <- unique(DX$RE1SIGMA)
+    all.res$RE2SIGMA <- unique(DX$RE2SIGMA)
+    all.res$NZEROS <- sum(DX$Mean.Count == 0)
+    
+    # compute the absolute errors
+    all.res$FE1Error <- abs(all.res$FE1 - all.res$FE1BETA)
+    all.res$FE2Error <- abs(all.res$FE2 - all.res$FE2BETA)
+    all.res$RE1Error <- abs(all.res$RE1 - all.res$RE1SIGMA)
+    all.res$RE2Error <- abs(all.res$RE2 - all.res$RE2SIGMA)
+
+    return(all.res)
+}, simplify=FALSE, fe=c("FE1", "FE2"), re=c("RE1", "RE2"))
+
+sigma.bench.df <- do.call(rbind.data.frame, sigma.benchmark.list)
+rownames(sigma.bench.df) <- NULL
+```
+
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(sigma.bench.df[sigma.bench.df$RE2SIGMA %in% c(1.0), ], 
+       aes(x=ordered(RE1SIGMA), y=RE1Error, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03c3"["1"]^{2})), y=expression(paste("| ", widehat("\u03c3"["1"]^{2})," - \u03c3"["1"]^{2}, " |"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_RE1Sigmavary_RE2-FE1-FE2fix-Error.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+The estimation error is pretty small when the other random effects are pretty small - here RE1 is fixed at 0.1. What is the effect of vary RE1?
+
+```{r, fig.height=3, fig.width=5}
+ggplot(sigma.bench.df[sigma.bench.df$RE2SIGMA %in% c(1.0), ],
+       aes(x=ordered(RE1SIGMA), y=RE1, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03c3"["1"]^{2})), 
+         y=expression(paste(widehat("\u03c3"["1"]^{2})))) +
+    # facet_wrap(~RE2SIGMA) +
+    # scale_y_continuous(limits=c(0, 5), oob=squish) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_RE1Sigmavary_RE2-FE1-FE2fix-Estimate.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+The effect seems _quite_ random. I suspect the sparsity in the dependent variable might be the bigger driver of errors.
+
+```{r, fig.height=3, fig.width=5}
+ggplot(sigma.bench.df[sigma.bench.df$RE1SIGMA %in% c(1.0), ], 
+       aes(x=ordered(RE2SIGMA), y=RE2Error, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03c3"["2"]^{2})), y=expression(paste("| ", widehat("\u03c3"["2"]^{2})," - \u03c3"["2"]^{2}, " |"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_RE2Sigmavary_RE1-FE1-FE2fix-Error.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(sigma.bench.df[sigma.bench.df$RE1SIGMA %in% c(1.0), ],
+       aes(x=ordered(RE2SIGMA), y=RE2, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point() +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03c3"["2"]^{2})), 
+         y=expression(paste(widehat("\u03c3"["2"]^{2})))) +
+    scale_y_continuous(limits=c(0, 5), oob=squish) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_RE2Sigmavary_RE1-FE1-FE2fix-Estimate.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+Does sparsity in the count variable affect the error magnitude?
+
+```{r, fig.height=3, fig.width=5}
+ggplot(sigma.bench.df[sigma.bench.df$RE2SIGMA %in% c(1.0), ], 
+       aes(x=ordered(round(NZEROS/n.indiv,2)), 
+           y=RE1Error, fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x="Sparsity #0's", y=expression(paste("| ", widehat("\u03c3"["1"]^{2})," - \u03c3"["1"]^{2}, " |"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_RE1Sigmavary-Sparsity_RE1-FE1-FE2fix-Error.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+Here the sparisty is _not_ related to the variance parameters.
+
+```{r, fig.height=3, fig.width=6}
+ggplot(sigma.bench.df, 
+       aes(x=NZEROS/n.indiv, 
+           y=RE1SIGMA)) +
+    # geom_bar(stat='identity', position='dodge') +
+    # geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x="Sparsity #0's", y=expression(paste("| ", widehat("\u03c3"["1"]^{2})," - \u03c3"["1"]^{2}, " |"))) +
+    expand_limits(y=c(0)) +
+    # theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) +
+    NULL
+
+```
+
+## P value comparison
+
+Milo uses the Satterthwaite method to estimate the degrees of freedom, while TMB uses some sort of ANOVA.  Are the p-values consistent across models?
+
+```{r}
+runModelPValue <- function(data.df, fe.var, re.var, glmm.model, ...){
+    # run each model with the input data and formula for benchmarking
+    # extract the fixed effect param p-values
+    if(glmm.model %in% c("Milo")){
+        set.seed(42)
+        
+        random.levels <- lapply(re.var, FUN=function(RX){
+            paste0(RX, unique(as.numeric(as.factor(data.df[, RX]))))
+        })
+        
+        names(random.levels) <- re.var
+
+        x.list <- list()
+        for(x in seq_along(fe.var)){
+            x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
+        }
+        x.list[["Intercept"]] <- rep(1, nrow(data.df))
+        X <- do.call(cbind, x.list)
+        X <- X[, c("Intercept", fe.var)]
+        colnames(X) <- c("Intercept", fe.var)
+        
+        z.list <- list()
+        for(q in seq_along(re.var)){
+            z.list[[re.var[q]]] <- data.df[, re.var[q]]
+        }
+        
+        Z <- do.call(cbind, z.list)
+        colnames(Z) <- re.var
+
+        y <- data.df$Mean.Count
+        dispersion <- unique(data.df$DISPERSION)
+        
+        # covariance between u's
+        glmm.control <- glmmControl.defaults()
+        glmm.control$theta.tol <- 1e-6
+        glmm.control$max.iter <- 50
+        
+        model.run <- fitGLMM(X=X, Z=Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                             glmm.control=glmm.control, dispersion=dispersion, solver="Fisher")
+        # need to compute the p-values
+        model.pval <- as.vector(model.run$PVALS)
+        
+    } else if(glmm.model %in% c("glmmTMB")){
+        re.vars <- unlist(sapply(re.var, FUN=function(RX) sprintf("(1|%s)", RX), simplify=FALSE))
+        mod.form <- paste0("Mean.Count ~ ", paste(c(1, fe.var, re.vars), collapse=" + "))
+        model.run <- glmmTMB(as.formula(mod.form), data=data.df, family=nbinom2(link="log"), REML=FALSE, se=TRUE)
+        
+        model.pval <- coefficients(summary(model.run))$cond[, 4]
+    } else if(glmm.model %in% c("PQL")){
+        re.vars <- unlist(sapply(re.var, FUN=function(RX) sprintf("1|%s", RX), simplify=FALSE))
+        re.mod <- paste0(" ~ ",  paste(re.vars, collapse=" + "))
+        fe.mod <- paste0("Mean.Count ~ ", paste(c(1, fe.var), collapse=" + "))
+        
+        model.pval <- tryCatch({
+            suppressMessages({
+                model.run <- glmmPQL(as.formula(fe.mod), as.formula(re.mod), family=nbinom2(link="log"), data=data.df)
+                model.pval <- coefficients(summary(model.run))[, 5]
+            })
+        }, error=function(err){
+            model.pval <- rep(NA, length(fe.var) +1)
+        })
+
+    } else if(glmm.model %in% c("Milo-kin")){
+        set.seed(42)
+        random.levels <- list()
+        random.levels[[re.var]] <- paste0(re.var, unique(as.numeric(as.factor(data.df[, re.var]))))
+        
+        x.list <- list()
+        for(x in seq_along(fe.var)){
+            x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
+        }
+        x.list[["Intercept"]] <- rep(1, nrow(data.df))
+        X <- do.call(cbind, x.list)
+        X <- X[, c("Intercept", fe.var)]
+        colnames(X) <- c("Intercept", fe.var)
+        
+        gen.Z <- matrix(0L, ncol=nrow(data.df), nrow=nrow(data.df))
+        diag(gen.Z) <- 1
+        colnames(gen.Z) <- paste0("Genetic", data.df$ID)
+        random.levels <- list("Genetic"=paste0("Genetic", data.df$ID))
+        
+        y <- data.df$Mean.Count
+        dispersion <- unique(data.df$DISPERSION)
+        
+        glmm.control <- glmmControl.defaults()
+        glmm.control$theta.tol <- 1e-6
+        glmm.control$max.iter <- 50
+        
+        model.list <- fitGLMM(X=X, Z=gen.Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                              glmm.control=glmm.control, dispersion=dispersion, Kin=big.kin, geno.only=TRUE, solver="HE-NNLS")
+        model.pval <- model.run$PVALS
+    }
+    
+    if(all(is.na(model.pval))){
+        model.pval <- rep(NA, length(fe.var)+1)
+    }
+    
+    names(model.pval) <- c("Intercept", fe.var)
+    return(model.pval)
+}
+
+```
+
+This is the basic function for running each model on each simulation.
+
+```{r, warning=FALSE}
+fe.benchmark.list <- sapply(seq_along(fe.data.list), FUN=function(iX, fe, re){
+    DX <- fe.data.list[[iX]]
+    milo.res <- runModelPValue(DX, fe, re, "Milo")
+    tmb.res <- runModelPValue(DX, fe, re, "glmmTMB")
+    pql.res <- runModelPValue(DX, fe, re, "PQL")
+
+    all.res <- do.call(rbind.data.frame, list(milo.res, tmb.res, pql.res))
+    colnames(all.res) <- c("Intercept", fe)
+    all.res$Model <- c("Milo", "glmmTMB", "PQL")
+    all.res$FE1BETA <- unique(DX$FE1BETA)
+    all.res$FE2BETA <- unique(DX$FE2BETA)
+    all.res$RE1SIGMA <- unique(DX$RE1SIGMA)
+    all.res$RE2SIGMA <- unique(DX$RE2SIGMA)
+
+    return(all.res)
+}, simplify=FALSE, fe=c("FE1", "FE2"), re=c("RE1"))
+
+fe.bench.df <- do.call(rbind.data.frame, fe.benchmark.list)
+rownames(fe.bench.df) <- NULL
+```
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE2BETA %in% c(1.0), ], 
+       aes(x=ordered(FE1BETA), y=-log10(FE1), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b21")), y=expression(paste("-log"[10], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE1vary_RE1-FE2fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
+       aes(x=ordered(FE2BETA), y=-log10(FE2), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), y=expression(paste("-log"[10], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE2vary_RE1-FE1fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
+       aes(x=ordered(FE2BETA), y=-log10(Intercept), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), y=expression(paste("-log"[10], " \u03b2"["0"], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_Intercept_RE1-FE1fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE2BETA %in% c(1.0), ], 
+       aes(x=ordered(FE1BETA), y=-log10(Intercept), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), y=expression(paste("-log"[10], " \u03b2"["0"], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_Intercept_RE1-FE2fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+These plots show the p-value computation - this isn't actually the false discovery. I'll create a simulation where there is _no_ effect, the bootstrap the simulations to identify 
+the number of false discoveries at each ground truth value.
+
+### FDR evaluation
+
+```{r, warning=FALSE}
+set.seed(NULL)
+n.boots <- 100
+fe.fdr.list <- sapply(seq_along(fe.data.list), FUN=function(iX, fe, re, nboots){
+    DX <- fe.data.list[[iX]]
+    
+    boot.list <- list()
+    for(i in seq_len(nboots)){
+        iDX <- DX
+        # iDX$Mean.Count <- sample(iDX$Mean.Count)
+                
+        for(x in seq_along(fe)){
+            iDX[, fe[x]] <- sample(iDX[, fe[x]], size=nrow(iDX))
+        }
+        
+        milo.res <- runModelPValue(iDX, fe, re, "Milo")
+        tmb.res <- runModelPValue(iDX, fe, re, "glmmTMB")
+        pql.res <- runModelPValue(iDX, fe, re, "PQL")
+
+        all.res <- do.call(rbind.data.frame, list(milo.res, tmb.res, pql.res))
+        colnames(all.res) <- c("Intercept", fe)
+        all.res$Model <- c("Milo", "glmmTMB", "PQL")
+        
+        # summarise to get the number of false discoveries at different levels
+        fdr.levels <- c(0.1, 0.05, 0.01)
+        fdr.list <- list()
+        for(q in seq_along(fdr.levels)){
+            q.fdr <- fdr.levels[q]
+            
+            suppressMessages({
+                q.all.fdr <- all.res %>% melt(id.vars=c("Model")) %>% 
+                    group_by(Model, variable) %>% summarise(Sig=as.numeric(value < q.fdr))
+                })
+            q.all.fdr$FDRt <- q.fdr
+            fdr.list[[q]] <- q.all.fdr
+        }
+        
+        i.fdr.df <- do.call(rbind.data.frame, fdr.list)
+        i.fdr.df$Boot <- i
+        boot.list[[i]] <- i.fdr.df
+    }
+    
+    boot.df <- do.call(rbind.data.frame, boot.list)
+    
+    # compute FDR as proportion of false discoveries
+    suppressMessages({
+        all.res <- boot.df %>% group_by(Model, variable, FDRt) %>% summarise(FDR=sum(Sig)/nboots)
+    })
+    
+    all.res$FE1BETA <- unique(DX$FE1BETA)
+    all.res$FE2BETA <- unique(DX$FE2BETA)
+    all.res$RE1SIGMA <- unique(DX$RE1SIGMA)
+    all.res$RE2SIGMA <- unique(DX$RE2SIGMA)
+    
+    return(all.res)
+}, simplify=FALSE, fe=c("FE1", "FE2"), re=c("RE1"), nboots=n.boots)
+
+fe.fdr.df <- do.call(rbind.data.frame, fe.fdr.list)
+rownames(fe.fdr.df) <- NULL
+```
+
+
+```{r, fig.height=6, fig.width=7.5}
+line.df <- data.frame("FDR"=c(0.1, 0.05, 0.01), "FDRt"=0.1, 0.05, 0.01)
+
+ggplot(fe.fdr.df[fe.fdr.df$variable %in% c("FE2"),], 
+       aes(x=ordered(FDRt), y=FDR, fill=Model, colour=Model)) +
+    geom_hline(yintercept=0.1, lty=2, colour='grey20') +
+    geom_hline(yintercept=0.05, lty=2, colour='grey50') +
+    geom_hline(yintercept=0.01, lty=2, colour='grey80') +
+    
+    geom_boxplot() + 
+    # geom_jitter(size=2.5, position=position_jitterdodge(jitter.width=0.1)) +
+    
+    theme_cowplot() +
+    labs(x="FDR threshold", y="FDR") +
+    expand_limits(y=c(0)) +
+    facet_wrap(~FE2BETA, scales="free_y") +
+    NULL
+
+# ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FDR.png",
+#        height=3, width=5, dpi=300, bg='white')
+```
+
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
+       aes(x=ordered(FE2BETA), y=-log10(FE2), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), y=expression(paste("-log"[10], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_FE2vary_RE1-FE1fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
+       aes(x=ordered(FE2BETA), y=-log10(Intercept), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), y=expression(paste("-log"[10], " \u03b2"["0"], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_Intercept_RE1-FE1fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+
+```{r, fig.height=3, fig.width=5}
+ggplot(fe.bench.df[fe.bench.df$FE2BETA %in% c(1.0), ], 
+       aes(x=ordered(FE1BETA), y=-log10(Intercept), fill=Model, colour=Model)) +
+    # geom_bar(stat='identity', position='dodge') +
+    geom_line(aes(group=Model)) +
+    geom_point(size=2.5) +
+    theme_cowplot() +
+    labs(x=expression(paste("Ground truth \u03b22")), y=expression(paste("-log"[10], " \u03b2"["0"], " P-value"))) +
+    expand_limits(y=c(0)) +
+    NULL
+
+ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_benchmark_Intercept_RE1-FE2fix-pvalue.png",
+       height=3, width=5, dpi=300, bg='white')
+```
+
+

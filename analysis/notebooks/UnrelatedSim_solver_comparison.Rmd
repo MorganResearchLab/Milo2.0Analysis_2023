@@ -322,7 +322,45 @@ runModel <- function(data.df, fe.var, re.var, glmm.model, ...){
                              glmm.control=glmm.control, dispersion=dispersion, solver="HE")
         
         model.coef <- c(model.run$FE, model.run$Sigma)
-    } 
+    } else if(glmm.model %in% c("Milo-NNLS")){
+      set.seed(42)
+        
+        random.levels <- lapply(re.var, FUN=function(RX){
+            paste0(RX, unique(as.numeric(as.factor(data.df[, RX]))))
+        })
+        
+        names(random.levels) <- re.var
+
+        x.list <- list()
+        for(x in seq_along(fe.var)){
+            x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
+        }
+        x.list[["Intercept"]] <- rep(1, nrow(data.df))
+        X <- do.call(cbind, x.list)
+        X <- X[, c("Intercept", fe.var)]
+        colnames(X) <- c("Intercept", fe.var)
+        
+        z.list <- list()
+        for(q in seq_along(re.var)){
+            z.list[[re.var[q]]] <- data.df[, re.var[q]]
+        }
+        
+        Z <- do.call(cbind, z.list)
+        colnames(Z) <- re.var
+
+        y <- data.df$Mean.Count
+        dispersion <- unique(data.df$DISPERSION)
+        
+        # covariance between u's
+        glmm.control <- glmmControl.defaults()
+        glmm.control$theta.tol <- 1e-6
+        glmm.control$max.iter <- 50
+        
+        model.run <- fitGLMM(X=X, Z=Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                             glmm.control=glmm.control, dispersion=dispersion, solver="HE-NNLS")
+        
+        model.coef <- c(model.run$FE, model.run$Sigma)
+    }
     
     if(all(is.na(model.coef))){
         model.coef <- c(rep(NA, length(fe.var)+1), rep(NA, length(re.var)))
@@ -341,10 +379,11 @@ fe.benchmark.list <- sapply(seq_along(fe.data.list), FUN=function(iX, fe, re){
     DX <- fe.data.list[[iX]]
     fisher.res <- runModel(DX, fe, re, "Milo-Fisher")
     he.res <-  runModel(DX, fe, re, "Milo-HE")
+    nnls.res <-  runModel(DX, fe, re, "Milo-NNLS")
     
-    all.res <- do.call(rbind.data.frame, list(fisher.res, he.res))
+    all.res <- do.call(rbind.data.frame, list(fisher.res, he.res, nnls.res))
     colnames(all.res) <- c("Intercept", fe, re)
-    all.res$Model <- c("Fisher", "HE-NNLS")
+    all.res$Model <- c("Fisher", "HE", "NNLS")
     all.res$FE1BETA <- unique(DX$FE1BETA)
     all.res$FE2BETA <- unique(DX$FE2BETA)
     all.res$RE1SIGMA <- unique(DX$RE1SIGMA)
@@ -527,10 +566,11 @@ sigma.benchmark.list <- sapply(seq_along(re.data.list), FUN=function(iX, fe, re)
     DX <- re.data.list[[iX]]
     fisher.res <- runModel(DX, fe, re, "Milo-Fisher")
     he.res <-  runModel(DX, fe, re, "Milo-HE")
+    nnls.res <-  runModel(DX, fe, re, "Milo-NNLS")
 
-    all.res <- do.call(rbind.data.frame, list(fisher.res, he.res))
+    all.res <- do.call(rbind.data.frame, list(fisher.res, he.res, nnls.res))
     colnames(all.res) <- c("Intercept", fe, re)
-    all.res$Model <- c("Fisher", "HE-NNLS")
+    all.res$Model <- c("Fisher", "HE", "NNLS")
     all.res$FE1BETA <- unique(DX$FE1BETA)
     all.res$FE2BETA <- unique(DX$FE2BETA)
     all.res$RE1SIGMA <- unique(DX$RE1SIGMA)
@@ -647,7 +687,8 @@ ggplot(sigma.bench.df,
            y=RE1SIGMA)) +
     # geom_bar(stat='identity', position='dodge') +
     # geom_line(aes(group=Model)) +
-    geom_point(size=2.5, position=position_jitterdodge(jitter.width=0.1)) +
+    # geom_point(size=2.5, position=position_jitterdodge(jitter.width=0.1)) +
+  geom_point(size=2.5) +
     theme_cowplot() +
     labs(x="Sparsity #0's", y=expression(paste("| ", widehat("\u03c3"["1"]^{2})," - \u03c3"["1"]^{2}, " |"))) +
     expand_limits(y=c(0)) +
@@ -664,7 +705,7 @@ Milo uses the Satterthwaite method to estimate the degrees of freedom, while TMB
 runModelPValue <- function(data.df, fe.var, re.var, glmm.model, ...){
     # run each model with the input data and formula for benchmarking
     # extract the fixed effect param p-values
-    if(glmm.model %in% c("Milo")){
+    if(glmm.model %in% c("Milo-Fisher")){
         set.seed(42)
         
         random.levels <- lapply(re.var, FUN=function(RX){
@@ -703,31 +744,15 @@ runModelPValue <- function(data.df, fe.var, re.var, glmm.model, ...){
         # need to compute the p-values
         model.pval <- as.vector(model.run$PVALS)
         
-    } else if(glmm.model %in% c("glmmTMB")){
-        re.vars <- unlist(sapply(re.var, FUN=function(RX) sprintf("(1|%s)", RX), simplify=FALSE))
-        mod.form <- paste0("Mean.Count ~ ", paste(c(1, fe.var, re.vars), collapse=" + "))
-        model.run <- glmmTMB(as.formula(mod.form), data=data.df, family=nbinom2(link="log"), REML=FALSE, se=TRUE)
-        
-        model.pval <- coefficients(summary(model.run))$cond[, 4]
-    } else if(glmm.model %in% c("PQL")){
-        re.vars <- unlist(sapply(re.var, FUN=function(RX) sprintf("1|%s", RX), simplify=FALSE))
-        re.mod <- paste0(" ~ ",  paste(re.vars, collapse=" + "))
-        fe.mod <- paste0("Mean.Count ~ ", paste(c(1, fe.var), collapse=" + "))
-        
-        model.pval <- tryCatch({
-            suppressMessages({
-                model.run <- glmmPQL(as.formula(fe.mod), as.formula(re.mod), family=nbinom2(link="log"), data=data.df)
-                model.pval <- coefficients(summary(model.run))[, 5]
-            })
-        }, error=function(err){
-            model.pval <- rep(NA, length(fe.var) +1)
-        })
-
-    } else if(glmm.model %in% c("Milo-kin")){
+    } else if(glmm.model %in% c("Milo-HE")){
         set.seed(42)
-        random.levels <- list()
-        random.levels[[re.var]] <- paste0(re.var, unique(as.numeric(as.factor(data.df[, re.var]))))
         
+        random.levels <- lapply(re.var, FUN=function(RX){
+            paste0(RX, unique(as.numeric(as.factor(data.df[, RX]))))
+        })
+        
+        names(random.levels) <- re.var
+
         x.list <- list()
         for(x in seq_along(fe.var)){
             x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
@@ -737,21 +762,64 @@ runModelPValue <- function(data.df, fe.var, re.var, glmm.model, ...){
         X <- X[, c("Intercept", fe.var)]
         colnames(X) <- c("Intercept", fe.var)
         
-        gen.Z <- matrix(0L, ncol=nrow(data.df), nrow=nrow(data.df))
-        diag(gen.Z) <- 1
-        colnames(gen.Z) <- paste0("Genetic", data.df$ID)
-        random.levels <- list("Genetic"=paste0("Genetic", data.df$ID))
+        z.list <- list()
+        for(q in seq_along(re.var)){
+            z.list[[re.var[q]]] <- data.df[, re.var[q]]
+        }
         
+        Z <- do.call(cbind, z.list)
+        colnames(Z) <- re.var
+
         y <- data.df$Mean.Count
         dispersion <- unique(data.df$DISPERSION)
         
+        # covariance between u's
         glmm.control <- glmmControl.defaults()
         glmm.control$theta.tol <- 1e-6
         glmm.control$max.iter <- 50
         
-        model.list <- fitGLMM(X=X, Z=gen.Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
-                              glmm.control=glmm.control, dispersion=dispersion, Kin=big.kin, geno.only=TRUE, solver="HE-NNLS")
-        model.pval <- model.run$PVALS
+        model.run <- fitGLMM(X=X, Z=Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                             glmm.control=glmm.control, dispersion=dispersion, solver="HE")
+        # need to compute the p-values
+        model.pval <- as.vector(model.run$PVALS)
+    } else if(glmm.model %in% c("Milo-NNLS")){
+        set.seed(42)
+        
+        random.levels <- lapply(re.var, FUN=function(RX){
+            paste0(RX, unique(as.numeric(as.factor(data.df[, RX]))))
+        })
+        
+        names(random.levels) <- re.var
+
+        x.list <- list()
+        for(x in seq_along(fe.var)){
+            x.list[[fe.var[x]]] <- data.df[, fe.var[x]]
+        }
+        x.list[["Intercept"]] <- rep(1, nrow(data.df))
+        X <- do.call(cbind, x.list)
+        X <- X[, c("Intercept", fe.var)]
+        colnames(X) <- c("Intercept", fe.var)
+        
+        z.list <- list()
+        for(q in seq_along(re.var)){
+            z.list[[re.var[q]]] <- data.df[, re.var[q]]
+        }
+        
+        Z <- do.call(cbind, z.list)
+        colnames(Z) <- re.var
+
+        y <- data.df$Mean.Count
+        dispersion <- unique(data.df$DISPERSION)
+        
+        # covariance between u's
+        glmm.control <- glmmControl.defaults()
+        glmm.control$theta.tol <- 1e-6
+        glmm.control$max.iter <- 50
+        
+        model.run <- fitGLMM(X=X, Z=Z, y=y, offsets=rep(0, nrow(X)), random.levels=random.levels, REML = TRUE,
+                             glmm.control=glmm.control, dispersion=dispersion, solver="HE-NNLS")
+        # need to compute the p-values
+        model.pval <- as.vector(model.run$PVALS)
     }
     
     if(all(is.na(model.pval))){
@@ -769,13 +837,13 @@ This is the basic function for running each model on each simulation.
 ```{r, warning=FALSE}
 fe.benchmark.list <- sapply(seq_along(fe.data.list), FUN=function(iX, fe, re){
     DX <- fe.data.list[[iX]]
-    milo.res <- runModelPValue(DX, fe, re, "Milo")
-    tmb.res <- runModelPValue(DX, fe, re, "glmmTMB")
-    pql.res <- runModelPValue(DX, fe, re, "PQL")
+    fisher.res <- runModelPValue(DX, fe, re, "Milo-Fisher")
+    he.res <- runModelPValue(DX, fe, re, "Milo-HE")
+    nnls.res <- runModelPValue(DX, fe, re, "Milo-NNLS")
 
-    all.res <- do.call(rbind.data.frame, list(milo.res, tmb.res, pql.res))
+    all.res <- do.call(rbind.data.frame, list(fisher.res, he.res, nnls.res))
     colnames(all.res) <- c("Intercept", fe)
-    all.res$Model <- c("Milo", "glmmTMB", "PQL")
+    all.res$Model <- c("Fisher", "HE", "NNLS")
     all.res$FE1BETA <- unique(DX$FE1BETA)
     all.res$FE2BETA <- unique(DX$FE2BETA)
     all.res$RE1SIGMA <- unique(DX$RE1SIGMA)

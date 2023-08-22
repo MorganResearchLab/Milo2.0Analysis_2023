@@ -156,7 +156,6 @@ How many csQTLs are commonly colocalised between PanUKBB and FinnGen?
 trait.xtab <- as.matrix(table(combined.coloc.df$csQTL[grepl(str_to_lower(combined.coloc.df$PhenoDescription), pattern=paste(immune.trait.patterns, collapse="|"))],
                               combined.coloc.df$Study[grepl(str_to_lower(combined.coloc.df$PhenoDescription), pattern=paste(immune.trait.patterns, collapse="|"))]))
 
-
 trait.xtab.df <- data.frame("csQTL"=rownames(trait.xtab),
                             "is.FinnGene"=ifelse(apply(trait.xtab, 1, FUN=function(LX) LX[1] >=1), TRUE, FALSE),
                             "is.PanUKBB"=ifelse(apply(trait.xtab, 1, FUN=function(LX) LX[2] >=1), TRUE, FALSE),
@@ -307,6 +306,11 @@ How many gene-trait pairs are there?
 ```{r}
 gene.trait.pairs <- comb.csqtls[comb.csqtls$PhenoDescription %in% all.immune.traits, ] %>% group_by(Gene, PhenoPretty) %>% summarise("NCount"=n())
 gene.trait.pairs <- gene.trait.pairs[gene.trait.pairs$NCount >= 1, ]
+
+write.table(gene.trait.pairs[, c("Gene", "PhenoPretty")],
+            file="~/Dropbox/GLMM/results/GeneTraitPairs.tsv",
+            quote=FALSE, sep="\t", row.names=FALSE)
+
 nrow(gene.trait.pairs)
 ```
 

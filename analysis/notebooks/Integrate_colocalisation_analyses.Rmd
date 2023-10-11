@@ -1112,6 +1112,52 @@ for(q in seq_along(all.goi)){
 }
 ```
 
+We know a lot more about the csQTLs that colocalise with an eQTL and a trait, but what about the 211 that just colocalise with a trait? These are interesting as they 
+suggest either an alternative molecular QTL effect, or an impact upstream, such as on a cell fate decision.
+
+## Trait colocalised, but no eQTL
+
+```{r}
+has.eqtl <- unique(comb.csqtls$csQTL)
+has.trait <- unique(combined.coloc.df$csQTL)
+just.trait <- setdiff(has.trait, has.eqtl)
+```
+
+What are these traits?
 
 
+```{r, fig.height=7, fig.width=7}
+just.trait.traits <- combined.coloc.df$PhenoDescription[combined.coloc.df$csQTL %in% just.trait]
+
+
+immune.docs <- Corpus(VectorSource(gsub(just.trait.traits, pattern="_", replacement=" ")))
+immune.docs <- immune.docs %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(stripWhitespace)
+immune.docs <- tm_map(immune.docs, content_transformer(tolower))
+immune.docs <- tm_map(immune.docs, removeWords, stopwords("english"))
+
+# create a document-term-matrix
+immune.dtm <- TermDocumentMatrix(immune.docs) 
+immune.matrix <- as.matrix(immune.dtm) 
+immune.words <- sort(rowSums(immune.matrix),decreasing=TRUE) 
+immune.df <- data.frame(word = names(immune.words),freq=immune.words)
+
+set.seed(42) # for reproducibility 
+png("~/Dropbox/GLMM/plots/Trait-andOnlyTrait_wordcloud.png", height=7, width=7, res=300, units="in")
+wordcloud(words = immune.df$word, freq = immune.df$freq, min.freq = 1,
+          max.words=200, random.order=FALSE, rot.per=0.35,
+          colors=brewer.pal(8, "Dark2"))
+dev.off()
+
+wordcloud(words = immune.df$word, freq = immune.df$freq, min.freq = 1,
+          max.words=200, random.order=FALSE, rot.per=0.35,
+          colors=brewer.pal(8, "Dark2"))
+
+# immune.cloud <- wordcloud2(data=immune.df, size=1.6, color='random-dark')
+# 
+# saveWidget(immune.cloud, "tmp.html", selfcontained = F)
+# webshot("tmp.html", file="Trait_wordcloud.png", delay = 5, vwidth = 2000, vheight = 2000)
+```
 

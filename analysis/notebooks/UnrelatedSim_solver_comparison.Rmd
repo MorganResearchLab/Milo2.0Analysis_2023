@@ -436,8 +436,7 @@ ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_Solver-benchmark_FE1vary_FE2fix-estima
        height=3, width=5, dpi=300, bg='white')
 ```
 
-In general the effect size is _under-estimated_ compared to the ground truth. In fact, for these simulations, the sign is also always negative for the estimate - curious. This might 
-be a problem with the simulation. Do we observe the same for FE2?
+In general the effect size is _under-estimated_ compared to the ground truth.
 
 ```{r, fig.height=3, fig.width=5}
 ggplot(fe.bench.df[fe.bench.df$FE1BETA %in% c(1.0), ], 
@@ -505,6 +504,7 @@ ggplot(fe.bench.df,
 ggplot(fe.bench.df,
        aes(x=ordered(FE2BETA), y=RE1, colour=Model)) +
     # geom_bar(stat='identity', position='dodge') +
+  geom_hline(yintercept=0.5, lty=2, colour='grey80') +
     geom_line(position=position_jitterdodge(jitter.width=0.1), aes(group=Model)) +
     geom_point(size=2.5, position=position_jitterdodge(jitter.width=0.1)) +
     theme_cowplot() +
@@ -518,7 +518,8 @@ ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_Solver-benchmark_FE2vary_FE1fix-Sigma_
        height=3, width=5, dpi=300, bg='white')
 ```
 
-The ground truth variance estimate is 0.5 - most models do fairly well.
+The ground truth variance estimate is 0.5 - most models do fairly well and under-estimate the variance component or come close. Fisher scoring is quite variable when the variance 
+parameter is this small.
 
 ## RE variation benchmarking
 
@@ -626,7 +627,7 @@ ggsave("~/Dropbox/GLMM/plots/UnrelatedSim_Solver-benchmark_RE1Sigmavary_RE2-FE1-
        height=3, width=5, dpi=300, bg='white')
 ```
 
-The effect seems _quite_ random. I suspect the sparsity in the dependent variable might be the bigger driver of errors.
+Fisher scoring seems quite variable - the variance estimation is highly variable - why is this?
 
 ```{r, fig.height=3, fig.width=5}
 ggplot(sigma.bench.df[sigma.bench.df$RE1SIGMA %in% c(1.0), ], 

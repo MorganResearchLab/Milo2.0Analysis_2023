@@ -933,10 +933,15 @@ for(q in seq_along(all.goi)){
       q.ident <- unique(csqtl.eqtl.coloc.df$ident[csqtl.eqtl.coloc.df$Nhood %in% i.nh])
       q.col <- ct_cols[q.ident]
       
+      q.a1 <- gsub(k.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\3")
+      q.a2 <- gsub(k.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\4")
+      q.genos <- c(paste0(q.a1, q.a1), paste0(q.a1, q.a2), paste0(q.a2, q.a2))
+      
       q.box <- ggplot(q.gene.vis, aes(x=SNP, y=Gene)) +
         geom_boxplot(notch=FALSE, fill=q.col, outlier.size=0.5) +
         geom_jitter(width=0.1, shape=21, size=2, fill=darken(q.col)) +
         theme_cowplot() +
+        scale_x_discrete(labels=q.genos) +
         labs(x=k.snp, y=paste("log ", q.gene, "\nexpression")) +
         scale_y_continuous(limits=c(y.min-y.min.eps, y.max+y.max.eps)) +
         theme(text=element_text(family="Roboto")) +
@@ -971,6 +976,10 @@ for(x in seq_along(csqtls)) {
   x.df <- na.omit(data.frame("Samples"=x.samps, "Nhood"=x.counts[x.samps], "SNP"=as.vector(unlist(x.geno[1,x.samps]))))
   x.df$SNP <- as.factor(x.df$SNP)
   
+  x.a1 <- gsub(x.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\3")
+  x.a2 <- gsub(x.snp, pattern="([0-9]+)_([0-9]+)_([ATCG]+)_([ATCG]+)", replacement="\\4")
+  x.genos <- c(paste0(x.a1, x.a1), paste0(x.a1, x.a2), paste0(x.a2, x.a2))
+  
   x.pplot <- ggplot(x.df, aes(x=SNP, y=Nhood)) +
     geom_boxplot(colour='grey50', outlier.alpha=0) +
     geom_jitter(width=0.1) +
@@ -978,6 +987,7 @@ for(x in seq_along(csqtls)) {
                  mapping=aes(ymin=..y.., ymax=..y..), width=0.5) +
     theme_cowplot() +
     labs(x=x.snp, y=paste0("Nhood", x.nh, " (", x.ident, ")")) +
+    scale_x_discrete(labels=x.genos) +
     expand_limits(y=c(0)) +
     theme(text=element_text(family="Roboto")) +
     NULL

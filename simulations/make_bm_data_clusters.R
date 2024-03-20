@@ -7,7 +7,7 @@ suppressPackageStartupMessages({
   library(scran)
 })
 
-source('./src/benchmark_utils.R')
+source('./simulations/benchmark_utils.R')
 
 parser <- OptionParser()
 parser <- add_option(parser, "--data_RDS", type="character",
@@ -43,8 +43,9 @@ print("Loading dataset...")
 sce <- readRDS(data_path)
 
 if(class(sce) == "list"){
-    sce <- sce$mylo
-    meta.df <- sce$meta
+  meta.df <- sce$meta
+  sce <- sce$mylo
+  colData(sce)$Block <- meta.df[colnames(sce), ]$Block
 }
 
 ## Select population to simulate DA by size and save
@@ -54,21 +55,29 @@ if(class(sce) == "list"){
 if (str_detect(pop, "_")) {
   pop <- str_replace(pop, "_", " ")
 }
-sce <- add_synthetic_labels_by_cluster_genotype(sce, pop=paste0("B", pop), pop_column = "Block", seed=seed, pop_enr=pop_enr)
+
+het.p <- 0.5 # additive model
+sce <- add_synthetic_labels_by_cluster_genotype(sce, pop=paste0("B", pop), pop_column = "Block", seed=seed, pop_enr=pop_enr,
+                                                het=het.p)
+print(table(colData(sce)$Genotype1_prob))
 
 ## Consider TRUE DA effect size +- 10%
-if (pop_enr < 0.3) {
-  da_lower <- pop_enr + (pop_enr/100)*10
-  da_upper <- 1 - da_lower
+cond.probs <- c(1+pop_enr, (1 + pop_enr)*het.p, 1/3)
+cond.probs <- cond.probs/sum(cond.probs)
+
+if (pop_enr < 0.5) {
+  t.prob <- min(cond.probs)
+  da_lower <- t.prob - (t.prob/100) * 10
+  da_upper <- t.prob + (t.prob/100) * 10
 } else {
-  da_upper <- pop_enr - (pop_enr/100)*10
-  da_lower <- 1 - da_upper
+  t.prob <- max(cond.probs)
+  da_lower <- t.prob - (t.prob/100) * 10
+  da_upper <- t.prob + (t.prob/100) * 10
 }
 
-print(head(colData(sce)))
-print(da_lower)
-print(da_upper)
-true_labels <- ifelse(sce$Genotype1_prob < da_lower, "NegLFC", ifelse(sce$Genotype3_prob > da_upper, "PosLFC", "NotDA"))
+
+true_labels <- ifelse(sce$Genotype1_prob > da_lower & pop_enr >= 0.5, "PosLFC", 
+                      ifelse(sce$Genotype1_prob < da_upper & pop_enr <= 0.5, "NegLFC", "NotDA"))
 
 colData(sce)[["true_labels"]] <- true_labels
 if (str_detect(pop, " ")) {

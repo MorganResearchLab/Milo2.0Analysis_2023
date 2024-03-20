@@ -300,29 +300,38 @@ add_synthetic_labels_by_cluster <- function(sce, # SingleCellExperiment obj
 
 ## Simple synthetic condition labelling based on cluster membership
 add_synthetic_labels_by_cluster_genotype <- function(sce, # SingleCellExperiment obj
-					             pop, pop_column="celltype",
-                                            	     pop_enr = 0.7,
-                                            	     # redDim='pca.corrected', # embedding to use to simulate differential abundance
-                                            	     n_conditions=3, # number of genotypes to simulate
-                                            	     n_replicates=9, # number of replicates per condition
-                                            	     n_batches = 1, # number of technical batches per condition (at least 2 replicates per batch)
-                                            	     condition_balance = 1, # the distribution of cells across conditions (1 = equal)
-                                            	     m=2, # Fuzziness parameter (higher m, more fuzziness)
-                                            	     a_logit=0.5, # logit parameter
-                                            	     cap_enr=NULL,
-                                            	     seed=42){
+                                                     pop, pop_column="Block",
+                                                     pop_enr = 0.7, # the probability for the top genotype group on an additive scale
+                                                     het = 0.5, # 0.5 for additive model, adjust for recessive < 0.5 or dominant > 0.5
+                                              	     n_conditions=3, # number of genotypes to simulate
+                                              	     n_replicates=9, # number of replicates per condition
+                                              	     n_batches = 1, # number of technical batches per condition (at least 2 replicates per batch)
+                                              	     condition_balance = 1, # the distribution of cells across conditions (1 = equal)
+                                              	     m=2, # Fuzziness parameter (higher m, more fuzziness)
+                                              	     a_logit=0.5, # logit parameter
+                                              	     cap_enr=NULL,
+                                              	     seed=42){
   
   set.seed(seed)
   conditions = paste0("Genotype", 1:n_conditions)
-  min.prob <- 1/3 
+  min.prob <- 1/3
+  # h = heterozygote effect = 0.5 for additive model
+  # therefore, G1 = pop_enr, G2 = h*pop_enr, G3 = 1-pop_enr
+  # rescale so sum(G1, G2, G3) = 1
+  
+  # rescale pop_enr for 3 genotypes
   ## Set prop != 0.3 for cells in pop
   geno1_probability <- rep(min.prob, ncol(sce))
-  geno1_probability[sce[[pop_column]] == pop] <- pop_enr
+  geno1_probability[sce[[pop_column]] == pop] <- 1 + pop_enr
 
   geno2_probability <- rep(min.prob, ncol(sce))
-  geno2_probability[sce[[pop_column]] == pop] <- pop_enr
+  geno2_probability[sce[[pop_column]] == pop] <- (1 + pop_enr)*het
 
-  cond_probability = cbind(geno1_probability, geno2_probability, 1 - (geno1_probability + geno2_probability))
+  geno3_probability <- rep(min.prob, ncol(sce))
+  geno3_probability[sce[[pop_column]] == pop] <- min.prob
+  
+  cond_probability = cbind(geno1_probability, geno2_probability, geno3_probability)
+  cond_probability = t(apply(cond_probability, MARGIN=1, FUN=function(pc) pc/sum(pc))) # t because apply transposes output
   colnames(cond_probability) = conditions
   
   # Generate labels for condition and replicates

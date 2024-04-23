@@ -85,7 +85,6 @@ if (str_detect(pop, " ")) {
 }
 
 ## Save coldata
-#outdir <-'/nfs/team205/ed6/data/milo_benchmark/synthetic_data/'
 outprefix <- str_c("benchmark_", data_id, "_pop_", pop, '_enr', pop_enr, "_seed", seed)
 coldata <- data.frame(colData(sce)) %>% rownames_to_column()
 ofile <- paste(opt$output, paste0(outprefix, ".coldata.csv"), sep="/")
@@ -104,7 +103,6 @@ if (make_batch_effects=="yes") {
     write_csv(as.data.frame(X_pca) %>% rownames_to_column(), str_c(opt$output, outprefix, "_batchEffect", sd, ".pca.csv"))
   })
 } else {
-  print(reducedDimNames(sce))
   X_pca <- reducedDim(sce, "PCA")
   ## Save reduced dims
   write_csv(as.data.frame(X_pca) %>% rownames_to_column(), str_c(opt$output, outprefix, "_batchEffect0.pca.csv"))
